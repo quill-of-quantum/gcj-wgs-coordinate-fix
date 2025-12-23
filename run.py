@@ -14,10 +14,12 @@ SMOOTH_THRESHOLD = 800.0            # 上限：修复后小于此值才视为物
 MIN_IMPROVEMENT = 4.0              # 最小收益：修复必须改善至少 x m 才值得做
 AMBIGUOUS_THRESHOLD = 120.0         # 不确定区间：|improvement| < 此值时启用第三点
 LOOKAHEAD_GAIN = 20.0              # 前瞻收益阈值：防止微小差异触发修复
+SHARP_TURN_DEG = 60.0              # 锐角阈值：小于此角度视为异常转向
+SHARP_GAIN_MULTIPLIER = 50        # 锐角时的修复门槛倍数
 # ----------------------------------------
 
 # --- 1. 基础算法：GCJ-02 转 WGS-84 (逆向纠偏) ---
-# 这是把“跑偏”的高德坐标拉回 GPS 坐标的公式
+# 这是把"跑偏"的高德坐标拉回 GPS 坐标的公式
 def gcj02_to_wgs84(lng, lat):
     x_pi = 3.14159265358979324 * 3000.0 / 180.0
     pi = 3.1415926535897932384626
@@ -65,6 +67,49 @@ def get_distance(lon1, lat1, lon2, lat2):
     a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
     return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
+# --- 2.5. 角度计算工具 (方向连续性) ---
+def turning_angle(p1, p2, p3):
+    """
+    计算在 p2 点的"转向角"（单位：度）
+    p1, p2, p3: 元组 (lon, lat)
+    
+    返回值定义：
+    - 180°：直线（无转向）
+    - 90°：直角转弯
+    - 0°：极度锐角 / 回头弯
+    
+    注意：考虑经度尺度随纬度缩放（cos(lat)）
+    """
+    # 中间点的纬度，用于修正经度差
+    lat_mid = p2[1]
+    cos_lat = math.cos(math.radians(lat_mid))
+    
+    # 修正后的向量（经度差乘以 cos(lat_mid)）
+    v1 = np.array([
+        (p2[0] - p1[0]) * cos_lat,
+        p2[1] - p1[1]
+    ])
+    v2 = np.array([
+        (p3[0] - p2[0]) * cos_lat,
+        p3[1] - p2[1]
+    ])
+    
+    norm1 = np.linalg.norm(v1)
+    norm2 = np.linalg.norm(v2)
+    if norm1 == 0 or norm2 == 0:
+        return 180.0  # 静止点，视为直线（不惩罚）
+    
+    cos_theta = np.dot(v1, v2) / (norm1 * norm2)
+    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+    
+    # 向量夹角（数学定义：0° 同向，180° 反向）
+    angle_math = math.degrees(math.acos(cos_theta))
+    
+    # 转向角（业务定义：180° 直线，0° 极度锐角）
+    turning_deg = 180.0 - angle_math
+    
+    return turning_deg
+
 # --- 3. 核心修复逻辑 ---
 def auto_repair_trajectory(file_path, output_path):
     print("读取数据...")
@@ -83,6 +128,8 @@ def auto_repair_trajectory(file_path, output_path):
     debug_logs = []
     
     # 初始化第一个点
+    prev_valid_lon = None  # 上上个输出点
+    prev_valid_lat = None
     last_valid_lon = df.loc[0, 'longitude']
     last_valid_lat = df.loc[0, 'latitude']
     
@@ -110,6 +157,64 @@ def auto_repair_trajectory(file_path, output_path):
         cond_smooth = dist_if_fixed < SMOOTH_THRESHOLD
         cond_improve = improvement > MIN_IMPROVEMENT
 
+        # ---------- 角度检查（前向 + 后向）----------
+        sharp_turn = False
+        angle_prev_raw = None
+        angle_prev_fix = None
+        angle_next_raw = None
+        angle_next_fix = None
+        required_improvement = MIN_IMPROVEMENT
+        
+        # 前向角度：a-b-c（角在 b，即 last_valid）
+        if prev_valid_lon is not None:
+            angle_prev_raw = turning_angle(
+                (prev_valid_lon, prev_valid_lat),
+                (last_valid_lon, last_valid_lat),
+                (curr_raw_lon, curr_raw_lat)
+            )
+            
+            angle_prev_fix = turning_angle(
+                (prev_valid_lon, prev_valid_lat),
+                (last_valid_lon, last_valid_lat),
+                (curr_fix_lon, curr_fix_lat)
+            )
+        
+        # 后向角度：c-d-e（角在 d，即 i+1）
+        if i + 2 < len(df):
+            next_raw_lon = df.loc[i + 1, 'longitude']
+            next_raw_lat = df.loc[i + 1, 'latitude']
+            next_next_raw_lon = df.loc[i + 2, 'longitude']
+            next_next_raw_lat = df.loc[i + 2, 'latitude']
+            
+            angle_next_raw = turning_angle(
+                (curr_raw_lon, curr_raw_lat),
+                (next_raw_lon, next_raw_lat),
+                (next_next_raw_lon, next_next_raw_lat)
+            )
+            
+            angle_next_fix = turning_angle(
+                (curr_fix_lon, curr_fix_lat),
+                (next_raw_lon, next_raw_lat),
+                (next_next_raw_lon, next_next_raw_lat)
+            )
+        
+        # 判定是否存在锐角或显著变差
+        angle_margin = 20.0  # 允许的角度变化容差
+        
+        if angle_prev_fix is not None and angle_prev_fix < SHARP_TURN_DEG:
+            sharp_turn = True
+        if angle_next_fix is not None and angle_next_fix < SHARP_TURN_DEG:
+            sharp_turn = True
+        
+        # 修复导致角度显著变差
+        if angle_prev_fix is not None and angle_prev_fix + angle_margin < angle_prev_raw:
+            sharp_turn = True
+        if angle_next_fix is not None and angle_next_fix + angle_margin < angle_next_raw:
+            sharp_turn = True
+        
+        if sharp_turn:
+            required_improvement = MIN_IMPROVEMENT * SHARP_GAIN_MULTIPLIER
+
         # ---------- 一阶强判 ----------
         lookahead_used = False
         lookahead_decision = None
@@ -117,10 +222,15 @@ def auto_repair_trajectory(file_path, output_path):
         cost_fix = None
         
         # 条件 1：明显异常跳变且修复后合理 → 直接修
-        if cond_jump and improvement >= MIN_IMPROVEMENT and cond_smooth:
-            final_lon, final_lat = curr_fix_lon, curr_fix_lat
-            note = "REPAIRED (GCJ->WGS)"
-            decision = "REPAIRED"
+        if cond_jump and cond_smooth:
+            if improvement >= required_improvement:
+                final_lon, final_lat = curr_fix_lon, curr_fix_lat
+                note = "REPAIRED (GCJ->WGS)"
+                decision = "REPAIRED"
+            else:
+                final_lon, final_lat = curr_raw_lon, curr_raw_lat
+                note = "Original (SharpTurnBlocked)" if sharp_turn else "Original (InsufficientImprovement)"
+                decision = "BLOCKED_BY_ANGLE" if sharp_turn else "BLOCKED_BY_IMPROVEMENT"
         
         # 条件 2：模糊区 → 启用第三点裁决（在否决之前！）
         elif abs(improvement) < AMBIGUOUS_THRESHOLD and i + 1 < len(df):
@@ -142,7 +252,12 @@ def auto_repair_trajectory(file_path, output_path):
                 + get_distance(curr_fix_lon, curr_fix_lat, next_raw_lon, next_raw_lat)
             )
             
-            if cost_fix + LOOKAHEAD_GAIN < cost_raw:
+            # lookahead 也需考虑锐角惩罚
+            lookahead_threshold = LOOKAHEAD_GAIN
+            if sharp_turn:
+                lookahead_threshold *= SHARP_GAIN_MULTIPLIER
+            
+            if cost_fix + lookahead_threshold < cost_raw:
                 final_lon, final_lat = curr_fix_lon, curr_fix_lat
                 note = "REPAIRED (via LOOKAHEAD)"
                 decision = "LOOKAHEAD_FIX"
@@ -169,6 +284,8 @@ def auto_repair_trajectory(file_path, output_path):
         debug_logs.append({
             "index": i,
             "geoTime": df.loc[i, "geoTime"],
+            "prev_lon": prev_valid_lon,
+            "prev_lat": prev_valid_lat,
             "last_lon": last_valid_lon,
             "last_lat": last_valid_lat,
             "raw_lon": curr_raw_lon,
@@ -181,6 +298,12 @@ def auto_repair_trajectory(file_path, output_path):
             "cond_jump": cond_jump,
             "cond_smooth": cond_smooth,
             "cond_improve": cond_improve,
+            "angle_prev_raw": angle_prev_raw,
+            "angle_prev_fix": angle_prev_fix,
+            "angle_next_raw": angle_next_raw,
+            "angle_next_fix": angle_next_fix,
+            "sharp_turn": sharp_turn,
+            "required_improvement": required_improvement,
             "lookahead_used": lookahead_used,
             "lookahead_decision": lookahead_decision,
             "cost_raw": cost_raw,
@@ -194,7 +317,9 @@ def auto_repair_trajectory(file_path, output_path):
         fixed_lats.append(final_lat)
         notes.append(note)
         
-        # 更新"上一个有效点"
+        # 更新"上上个点"和"上一个有效点"
+        prev_valid_lon = last_valid_lon
+        prev_valid_lat = last_valid_lat
         last_valid_lon = final_lon
         last_valid_lat = final_lat
         
