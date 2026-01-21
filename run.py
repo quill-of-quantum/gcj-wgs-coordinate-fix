@@ -7,7 +7,7 @@ import math
 import numpy as np
 
 # ---------------- 配置区域 ----------------
-INPUT_FILE = './output/cut.csv'    # 乱序文件
+INPUT_FILE = './data/灵敢足迹（2025.12.22）.csv'    # 乱序文件
 OUTPUT_FILE = './output/gps_data_perfect.csv' # 修复后的文件
 JUMP_DETECT_THRESHOLD = 50.0       # 下限：超过此值判定为异常跳变
 SMOOTH_THRESHOLD = 800.0            # 上限：修复后小于此值才视为物理合理
