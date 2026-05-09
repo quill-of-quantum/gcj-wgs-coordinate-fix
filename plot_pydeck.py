@@ -28,7 +28,7 @@ except ImportError as exc:
 
 
 # ================= Config =================
-INPUT_FILE = "./output/gps_data_perfect.csv"
+INPUT_FILE = "./output/gps_data_manual_export.csv"
 OUTPUT_HTML = "trajectory_pydeck.html"
 DRAW_RAW_PATH = True
 DRAW_CLEAN_PATH = True

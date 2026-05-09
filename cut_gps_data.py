@@ -18,8 +18,8 @@ LINE_START = 2      # 起始行（包含表头算第1行）
 LINE_END = 10       # 结束行
 
 # ---------- 时间模式 ----------
-START_TIME = "2025-03-09 10:00:00"
-END_TIME   = "2025-05-09 23:59:00"
+START_TIME = "2026-04-09 10:00:00"
+END_TIME   = "2026-05-09 23:59:00"
 
 TIMEZONE_OFFSET = 2     # UTC+2
 GEOTIME_COLUMN = "geoTime"

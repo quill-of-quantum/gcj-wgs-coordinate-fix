@@ -181,6 +181,7 @@ class AppState:
     timezone_name: str = DEFAULT_TIMEZONE
     selected_idx: set[int] = field(default_factory=set)
     selected_day: Optional[str] = None
+    selected_days: set[str] = field(default_factory=set)
     view_mask: Optional[pd.Series] = None
     modified_idx: set[int] = field(default_factory=set)
     history: list[list[dict[str, Any]]] = field(default_factory=list)
@@ -188,6 +189,7 @@ class AppState:
     focus_history_depth: int = 0
     focus_selected_idx: set[int] = field(default_factory=set)
     focus_selected_day: Optional[str] = None
+    focus_selected_days: set[str] = field(default_factory=set)
     edit_revision: int = 0
     export_revision: int = 0
     data_revision: int = 0
@@ -571,7 +573,7 @@ HTML = f"""
     }});
 
     function startBoxSelection(event) {{
-      if (!backend || !isPointMode()) return;
+      if (!backend) return;
       if (!(event.originalEvent.metaKey || event.originalEvent.ctrlKey)) return;
       if (event.originalEvent.button !== 0) return;
       boxSelecting = true;
@@ -620,24 +622,44 @@ HTML = f"""
       return ids;
     }}
 
+    function featureDaysInScreenBox(rect) {{
+      const days = new Set();
+      currentRenderedFeatures.forEach(feature => {{
+        if (!feature.geometry || !feature.geometry.coordinates) return;
+        const coords = feature.geometry.coordinates;
+        const point = map.latLngToContainerPoint([coords[1], coords[0]]);
+        if (
+          point.x >= rect.left && point.x <= rect.right &&
+          point.y >= rect.top && point.y <= rect.bottom
+        ) {{
+          const localDay = feature.properties && feature.properties.local_day ? feature.properties.local_day : '';
+          if (localDay) days.add(localDay);
+        }}
+      }});
+      return Array.from(days);
+    }}
+
     function finishBoxSelection(event) {{
       if (!boxSelecting) return;
       boxSelecting = false;
       enableMapDragging();
-      if (!boxMoved || !boxRect || !backend || !isPointMode()) {{
+      if (!boxMoved || !boxRect || !backend) {{
         clearBoxRect();
         boxStartPoint = null;
         return;
       }}
       suppressNextClick = true;
       const rect = boxRect;
-      const selectedIds = featureIdsInScreenBox(rect);
+      const isLine = currentPayload && currentPayload.selection_mode === 'line';
       clearBoxRect();
       boxStartPoint = null;
-      backend.selectIndices(
-        selectedIds, false,
-        function() {{ refresh(false); }}
-      );
+      if (isLine) {{
+        const selectedDays = featureDaysInScreenBox(rect);
+        backend.selectDays(selectedDays, false, function() {{ refresh(false); }});
+      }} else {{
+        const selectedIds = featureIdsInScreenBox(rect);
+        backend.selectIndices(selectedIds, false, function() {{ refresh(false); }});
+      }}
       if (event && event.originalEvent) {{
         L.DomEvent.stop(event.originalEvent);
       }}
@@ -713,9 +735,11 @@ HTML = f"""
         let line = lineLayerMap.get(segId);
         if (!line) {{
           line = L.polyline(coords, lineStyle(seg));
-          line.on('click', function() {{
+          line.on('click', function(event) {{
             if (!backend) return;
-            backend.selectDay(seg.day, function() {{ refresh(false); }});
+            const e = event.originalEvent || {{}};
+            const additive = !!(e.metaKey || e.ctrlKey);
+            backend.selectDays([seg.day], additive, function() {{ refresh(false); }});
           }});
           line.segId = segId;
           line.segDay = seg.day;
@@ -758,7 +782,8 @@ HTML = f"""
             if (!backend) return;
             const layerProps = layer.featureProps || {{}};
             if ((payload.selection_mode || 'line') === 'line') {{
-              backend.selectDay(layerProps.local_day || '', function() {{ refresh(false); }});
+              const additive = !!(event.originalEvent && (event.originalEvent.metaKey || event.originalEvent.ctrlKey));
+              backend.selectDays([layerProps.local_day || ''], additive, function() {{ refresh(false); }});
               return;
             }}
             const e = event.originalEvent || {{}};
@@ -986,7 +1011,12 @@ class Backend(QObject):
         total = len(self.state.df)
         modified = len(self.state.modified_idx)
         selected = len(self._active_selection())
-        day_text = self.state.selected_day or "-"
+        if self.state.selected_days:
+            day_text = ",".join(sorted(self.state.selected_days)[:3])
+            if len(self.state.selected_days) > 3:
+                day_text += f"...(+{len(self.state.selected_days) - 3})"
+        else:
+            day_text = self.state.selected_day or "-"
         focus_text = "on" if self.state.focus_active else "off"
         export_text = "clean" if self.state.edit_revision == self.state.export_revision else "needs export"
         return (
@@ -1177,8 +1207,14 @@ class Backend(QObject):
         return {"ok": True, "undone": len(batch)}
 
     def _active_selection(self) -> set[int]:
-        if self.state.selection_mode == "line" and self.state.selected_day:
-            return self._indices_for_day(self.state.selected_day)
+        if self.state.selection_mode == "line":
+            if self.state.selected_days:
+                selected: set[int] = set()
+                for day in self.state.selected_days:
+                    selected.update(self._indices_for_day(day))
+                return selected
+            if self.state.selected_day:
+                return self._indices_for_day(self.state.selected_day)
         return set(self.state.selected_idx)
 
     def _indices_for_day(self, day: str) -> set[int]:
@@ -1350,9 +1386,11 @@ class Backend(QObject):
             self.state._cached_route_key = cache_key
             self.state._cached_route_segments = segments
 
-        selected_day = self.state.selected_day
+        selected_days = set(self.state.selected_days)
+        if not selected_days and self.state.selected_day:
+            selected_days = {self.state.selected_day}
         return [
-            {"day": seg["day"], "coords": seg["coords"], "selected": seg["day"] == selected_day}
+            {"day": seg["day"], "seg_id": seg["seg_id"], "coords": seg["coords"], "selected": seg["day"] in selected_days}
             for seg in self.state._cached_route_segments
         ]
 
@@ -1483,6 +1521,7 @@ class Backend(QObject):
         self.state.selection_mode = mode
         self.state.selected_idx.clear()
         self.state.selected_day = None
+        self.state.selected_days.clear()
         return {"ok": True}
 
     @pyqtSlot(str, result="QVariant")
@@ -1496,6 +1535,8 @@ class Backend(QObject):
         if self.state.selected_day is not None and self.state.dt_series is not None:
             if not self._indices_for_day(self.state.selected_day):
                 self.state.selected_day = None
+        if self.state.selected_days and self.state.dt_series is not None:
+            self.state.selected_days = {day for day in self.state.selected_days if self._indices_for_day(day)}
         return {"ok": True}
 
     @pyqtSlot(result="QVariant")
@@ -1509,6 +1550,7 @@ class Backend(QObject):
         self.state.focus_history_depth = len(self.state.history)
         self.state.focus_selected_idx = set(self.state.selected_idx)
         self.state.focus_selected_day = self.state.selected_day
+        self.state.focus_selected_days = set(self.state.selected_days)
         self.state.update_view_indices(active_selection)
         return {"ok": True, "focused": len(active_selection)}
 
@@ -1520,6 +1562,7 @@ class Backend(QObject):
         self.state.focus_history_depth = 0
         self.state.focus_selected_idx = set()
         self.state.focus_selected_day = None
+        self.state.focus_selected_days = set()
         self.state.update_view_all()
         return {"ok": True}
 
@@ -1533,8 +1576,10 @@ class Backend(QObject):
         self.state.focus_history_depth = 0
         self.state.selected_idx = set(self.state.focus_selected_idx)
         self.state.selected_day = self.state.focus_selected_day
+        self.state.selected_days = set(self.state.focus_selected_days)
         self.state.focus_selected_idx = set()
         self.state.focus_selected_day = None
+        self.state.focus_selected_days = set()
         self.state.update_view_all()
         return {"ok": True}
 
@@ -1548,6 +1593,7 @@ class Backend(QObject):
         if not idxs:
             return {"ok": False, "error": f"no points found for day {day}"}
         self.state.selected_day = day
+        self.state.selected_days = {day}
         self.state.selected_idx = idxs
         return {"ok": True, "selected": len(idxs)}
 
@@ -1564,6 +1610,7 @@ class Backend(QObject):
         )
         self.state.selected_idx = set(df_view[mask].index.tolist())
         self.state.selected_day = None
+        self.state.selected_days.clear()
         return {"ok": True, "selected": len(self.state.selected_idx)}
 
     @pyqtSlot(int, bool, result="QVariant")
@@ -1579,6 +1626,7 @@ class Backend(QObject):
         else:
             self.state.selected_idx.add(idx)
         self.state.selected_day = None
+        self.state.selected_days.clear()
         return {"ok": True, "selected": len(self.state.selected_idx)}
 
     @pyqtSlot("QVariantList", bool, result="QVariant")
@@ -1593,12 +1641,29 @@ class Backend(QObject):
         else:
             self.state.selected_idx = valid_indices
         self.state.selected_day = None
+        self.state.selected_days.clear()
         return {"ok": True, "selected": len(self.state.selected_idx)}
+
+    @pyqtSlot("QVariantList", bool, result="QVariant")
+    def selectDays(self, days: list[Any], additive: bool) -> dict[str, Any]:
+        if self.state.selection_mode != "line":
+            return {"ok": False, "error": "day selection is only available in line mode"}
+        valid_days = {str(day) for day in days if isinstance(day, str) and self._indices_for_day(str(day))}
+        if not valid_days:
+            return {"ok": False, "error": "no valid days found in selection"}
+        if additive:
+            self.state.selected_days.update(valid_days)
+        else:
+            self.state.selected_days = set(valid_days)
+        self.state.selected_day = sorted(self.state.selected_days)[0] if self.state.selected_days else None
+        self.state.selected_idx = self._active_selection()
+        return {"ok": True, "selected": len(self.state.selected_idx), "days": len(self.state.selected_days)}
 
     @pyqtSlot(result="QVariant")
     def clearSelection(self) -> dict[str, Any]:
         self.state.selected_idx.clear()
         self.state.selected_day = None
+        self.state.selected_days.clear()
         return {"ok": True}
 
     @pyqtSlot(float, float, result="QVariant")
