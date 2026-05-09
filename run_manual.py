@@ -298,6 +298,14 @@ HTML = f"""
       background: rgba(37, 99, 235, 0.10);
       border: 2px solid rgba(37, 99, 235, 0.9);
     }}
+    .screen-box-select {{
+      position: absolute;
+      border: 2px solid rgba(37, 99, 235, 0.9);
+      background: rgba(37, 99, 235, 0.10);
+      pointer-events: none;
+      z-index: 800;
+      display: none;
+    }}
   </style>
 </head>
 <body>
@@ -358,8 +366,14 @@ HTML = f"""
 
   <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet-rotate@0.2.8/dist/leaflet-rotate-src.js"></script>
   <script>
-    const map = L.map('map', {{ preferCanvas: true }});
+    const ROTATE_SPEED = 90;
+    const map = L.map('map', {{
+      preferCanvas: true,
+      rotate: true,
+      bearing: 0
+    }});
     L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
       maxZoom: 19,
       attribution: '&copy; OpenStreetMap contributors'
@@ -377,9 +391,73 @@ HTML = f"""
     let boxRect = null;
     let suppressNextClick = false;
     let refreshTimer = null;
+    let currentRenderedFeatures = [];
+    let rotationFrame = null;
+    let rotationDirection = 0;
+    let lastRotateTs = null;
+    const pressedRotationKeys = new Set();
+    const screenBox = document.createElement('div');
+    screenBox.className = 'screen-box-select';
+    map.getContainer().appendChild(screenBox);
 
     function setStatus(text) {{
       document.getElementById('statusText').textContent = text || '';
+    }}
+
+    function normalizeBearing(angle) {{
+      let normalized = angle % 360;
+      if (normalized < 0) normalized += 360;
+      return normalized;
+    }}
+
+    function rotateMap(delta) {{
+      if (!map.setBearing || !map.getBearing) return;
+      map.setBearing(normalizeBearing(map.getBearing() + delta));
+    }}
+
+    function resetBearing() {{
+      if (!map.setBearing) return;
+      map.setBearing(0);
+    }}
+
+    function updateRotationDirection() {{
+      const hasQ = pressedRotationKeys.has('q');
+      const hasE = pressedRotationKeys.has('e');
+      if (hasQ && !hasE) {{
+        rotationDirection = -1;
+      }} else if (hasE && !hasQ) {{
+        rotationDirection = 1;
+      }} else {{
+        rotationDirection = 0;
+      }}
+    }}
+
+    function stepRotation(ts) {{
+      if (rotationDirection === 0) {{
+        rotationFrame = null;
+        lastRotateTs = null;
+        return;
+      }}
+      if (lastRotateTs === null) {{
+        lastRotateTs = ts;
+      }}
+      const deltaSeconds = Math.min((ts - lastRotateTs) / 1000, 0.05);
+      lastRotateTs = ts;
+      rotateMap(rotationDirection * ROTATE_SPEED * deltaSeconds);
+      rotationFrame = window.requestAnimationFrame(stepRotation);
+    }}
+
+    function ensureRotationLoop() {{
+      if (rotationFrame !== null || rotationDirection === 0) return;
+      rotationFrame = window.requestAnimationFrame(stepRotation);
+    }}
+
+    function stopRotationLoop() {{
+      if (rotationFrame !== null) {{
+        window.cancelAnimationFrame(rotationFrame);
+        rotationFrame = null;
+      }}
+      lastRotateTs = null;
     }}
 
     function isPointMode() {{
@@ -387,10 +465,8 @@ HTML = f"""
     }}
 
     function clearBoxRect() {{
-      if (boxRect) {{
-        map.removeLayer(boxRect);
-        boxRect = null;
-      }}
+      boxRect = null;
+      screenBox.style.display = 'none';
     }}
 
     function enableMapDragging() {{
@@ -414,14 +490,45 @@ HTML = f"""
 
     document.addEventListener('keydown', function(event) {{
       updateModifierState(event, true);
+      const tagName = event.target && event.target.tagName ? event.target.tagName.toLowerCase() : '';
+      if (tagName === 'input' || tagName === 'textarea' || tagName === 'select') return;
+      if (event.key === 'q' || event.key === 'Q') {{
+        event.preventDefault();
+        pressedRotationKeys.add('q');
+        updateRotationDirection();
+        ensureRotationLoop();
+      }} else if (event.key === 'e' || event.key === 'E') {{
+        event.preventDefault();
+        pressedRotationKeys.add('e');
+        updateRotationDirection();
+        ensureRotationLoop();
+      }} else if (event.key === 'r' || event.key === 'R') {{
+        event.preventDefault();
+        pressedRotationKeys.clear();
+        updateRotationDirection();
+        stopRotationLoop();
+        resetBearing();
+      }}
     }});
 
     document.addEventListener('keyup', function(event) {{
       updateModifierState(event, false);
+      if (event.key === 'q' || event.key === 'Q') {{
+        pressedRotationKeys.delete('q');
+        updateRotationDirection();
+        if (rotationDirection === 0) stopRotationLoop();
+      }} else if (event.key === 'e' || event.key === 'E') {{
+        pressedRotationKeys.delete('e');
+        updateRotationDirection();
+        if (rotationDirection === 0) stopRotationLoop();
+      }}
     }});
 
     window.addEventListener('blur', function() {{
       modifierPressed = false;
+      pressedRotationKeys.clear();
+      updateRotationDirection();
+      stopRotationLoop();
       if (!boxSelecting) {{
         enableMapDragging();
       }}
@@ -448,15 +555,33 @@ HTML = f"""
       if (!boxMoved && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) {{
         boxMoved = true;
       }}
-      const startLatLng = map.containerPointToLatLng(boxStartPoint);
-      const endLatLng = map.containerPointToLatLng(currentPoint);
-      const bounds = L.latLngBounds(startLatLng, endLatLng);
-      if (!boxRect) {{
-        boxRect = L.rectangle(bounds, {{ className: 'map-box-select', weight: 2, fillOpacity: 0.10 }});
-        boxRect.addTo(map);
-      }} else {{
-        boxRect.setBounds(bounds);
-      }}
+      boxRect = {{
+        left: Math.min(boxStartPoint.x, currentPoint.x),
+        top: Math.min(boxStartPoint.y, currentPoint.y),
+        right: Math.max(boxStartPoint.x, currentPoint.x),
+        bottom: Math.max(boxStartPoint.y, currentPoint.y),
+      }};
+      screenBox.style.display = 'block';
+      screenBox.style.left = `${{boxRect.left}}px`;
+      screenBox.style.top = `${{boxRect.top}}px`;
+      screenBox.style.width = `${{boxRect.right - boxRect.left}}px`;
+      screenBox.style.height = `${{boxRect.bottom - boxRect.top}}px`;
+    }}
+
+    function featureIdsInScreenBox(rect) {{
+      const ids = [];
+      currentRenderedFeatures.forEach(feature => {{
+        if (!feature.geometry || !feature.geometry.coordinates) return;
+        const coords = feature.geometry.coordinates;
+        const point = map.latLngToContainerPoint([coords[1], coords[0]]);
+        if (
+          point.x >= rect.left && point.x <= rect.right &&
+          point.y >= rect.top && point.y <= rect.bottom
+        ) {{
+          ids.push(feature.properties.idx);
+        }}
+      }});
+      return ids;
     }}
 
     function finishBoxSelection(event) {{
@@ -469,11 +594,12 @@ HTML = f"""
         return;
       }}
       suppressNextClick = true;
-      const bounds = boxRect.getBounds();
+      const rect = boxRect;
+      const selectedIds = featureIdsInScreenBox(rect);
       clearBoxRect();
       boxStartPoint = null;
-      backend.selectBounds(
-        bounds.getSouth(), bounds.getWest(), bounds.getNorth(), bounds.getEast(),
+      backend.selectIndices(
+        selectedIds, false,
         function() {{ refresh(false); }}
       );
       if (event && event.originalEvent) {{
@@ -551,6 +677,7 @@ HTML = f"""
       }});
 
       const geojson = payload.point_features || {{ type: 'FeatureCollection', features: [] }};
+      currentRenderedFeatures = geojson.features || [];
       pointsLayer = L.geoJSON(geojson, {{
         pointToLayer: function(feature, latlng) {{
           return L.circleMarker(latlng, pointStyle(feature));
@@ -594,7 +721,7 @@ HTML = f"""
       }}
       const bounds = map.getBounds();
       backend.requestDataForViewport(
-        bounds.getSouth(), bounds.getWest(), bounds.getNorth(), bounds.getEast(),
+        bounds.getSouth(), bounds.getWest(), bounds.getNorth(), bounds.getEast(), map.getZoom(),
         function(payload) {{
         renderData(payload);
         }}
@@ -607,7 +734,7 @@ HTML = f"""
       }}
       refreshTimer = setTimeout(function() {{
         refresh(false);
-      }}, 120);
+      }}, 220);
     }}
 
     function refreshFromMeta() {{
@@ -707,10 +834,6 @@ HTML = f"""
       if (!backend || !hasFitBounds || boxSelecting) return;
       scheduleRefresh();
     }});
-    map.on('zoomend', function() {{
-      if (!backend || !hasFitBounds || boxSelecting) return;
-      scheduleRefresh();
-    }});
 
     new QWebChannel(qt.webChannelTransport, function(channel) {{
       backend = channel.objects.backend;
@@ -778,17 +901,25 @@ class Backend(QObject):
             remaining = remaining[_sample_indices(len(remaining), extra_needed)]
         return np.concatenate([keep, remaining])
 
-    def _serialize_points(self, df_view: pd.DataFrame) -> dict[str, Any]:
+    def _viewport_limits(self, zoom: float) -> tuple[int, int]:
+        if zoom <= 5:
+            return 800, 4000
+        if zoom <= 7:
+            return 1500, 7000
+        if zoom <= 9:
+            return 3000, 10000
+        if zoom <= 11:
+            return 5000, 14000
+        if self.state.selection_mode == "point":
+            return MAX_VIEWPORT_POINTS_POINT_MODE, MAX_VIEWPORT_LINE_POINTS
+        return MAX_VIEWPORT_POINTS_LINE_MODE, MAX_VIEWPORT_LINE_POINTS
+
+    def _serialize_points(self, df_view: pd.DataFrame, max_points: int) -> dict[str, Any]:
         features: list[dict[str, Any]] = []
         idx_list = df_view.index.to_numpy()
         local_day_series = self.state.local_day_series()
         local_dt_series = self.state.local_dt_series()
         active_selection = self._active_selection()
-        max_points = (
-            MAX_VIEWPORT_POINTS_POINT_MODE
-            if self.state.selection_mode == "point"
-            else MAX_VIEWPORT_POINTS_LINE_MODE
-        )
         sampled_indices = self._limit_indices(idx_list, max_points, active_selection)
         sampled_df = self.state.df.loc[sampled_indices, [self.state.lon_col, self.state.lat_col]]
         lon_values = sampled_df[self.state.lon_col].to_numpy()
@@ -823,7 +954,7 @@ class Backend(QObject):
             )
         return {"type": "FeatureCollection", "features": features}
 
-    def _route_segments(self, df_view: pd.DataFrame) -> list[dict[str, Any]]:
+    def _route_segments(self, df_view: pd.DataFrame, max_line_points: int) -> list[dict[str, Any]]:
         if df_view.empty:
             return []
         if len(df_view):
@@ -837,6 +968,7 @@ class Backend(QObject):
             len(df_view),
             first_idx,
             last_idx,
+            max_line_points,
         )
         if self.state._cached_route_key != cache_key or self.state._cached_route_segments is None:
             segments: list[dict[str, Any]] = []
@@ -863,8 +995,8 @@ class Backend(QObject):
                 current: list[list[float]] = []
                 prev_lat = prev_lon = None
                 ordered_idxs = idxs
-                if len(ordered_idxs) > MAX_VIEWPORT_LINE_POINTS:
-                    ordered_idxs = ordered_idxs[_sample_indices(len(ordered_idxs), MAX_VIEWPORT_LINE_POINTS)]
+                if len(ordered_idxs) > max_line_points:
+                    ordered_idxs = ordered_idxs[_sample_indices(len(ordered_idxs), max_line_points)]
                 coord_df = self.state.df.loc[ordered_idxs, [self.state.lon_col, self.state.lat_col]]
                 lon_values = coord_df[self.state.lon_col].to_numpy()
                 lat_values = coord_df[self.state.lat_col].to_numpy()
@@ -977,16 +1109,17 @@ class Backend(QObject):
             "status_text": self._status_text(),
         }
 
-    def _payload_for_df(self, df_view: pd.DataFrame) -> dict[str, Any]:
+    def _payload_for_df(self, df_view: pd.DataFrame, zoom: float) -> dict[str, Any]:
         center_lat = center_lon = None
         if not df_view.empty:
             valid = df_view[[self.state.lat_col, self.state.lon_col]].dropna()
             if not valid.empty:
                 center_lat = float(valid[self.state.lat_col].mean())
                 center_lon = float(valid[self.state.lon_col].mean())
+        max_points, max_line_points = self._viewport_limits(zoom)
         return {
-            "route_segments": self._route_segments(df_view),
-            "point_features": self._serialize_points(df_view),
+            "route_segments": self._route_segments(df_view, max_line_points),
+            "point_features": self._serialize_points(df_view, max_points),
             "center_lat": center_lat,
             "center_lon": center_lon,
             "status_text": self._status_text(),
@@ -996,13 +1129,15 @@ class Backend(QObject):
 
     @pyqtSlot(result="QVariant")
     def requestData(self) -> dict[str, Any]:
-        return self._payload_for_df(self.state.get_view_df())
+        return self._payload_for_df(self.state.get_view_df(), zoom=12.0)
 
-    @pyqtSlot(float, float, float, float, result="QVariant")
-    def requestDataForViewport(self, south: float, west: float, north: float, east: float) -> dict[str, Any]:
+    @pyqtSlot(float, float, float, float, float, result="QVariant")
+    def requestDataForViewport(
+        self, south: float, west: float, north: float, east: float, zoom: float
+    ) -> dict[str, Any]:
         viewport_mask = self._viewport_mask(south, west, north, east)
         df_view = self.state.df[viewport_mask]
-        return self._payload_for_df(df_view)
+        return self._payload_for_df(df_view, zoom=zoom)
 
     @pyqtSlot(str, result="QVariant")
     def setMode(self, mode: str) -> dict[str, Any]:
@@ -1066,6 +1201,20 @@ class Backend(QObject):
             self.state.selected_idx.discard(idx)
         else:
             self.state.selected_idx.add(idx)
+        self.state.selected_day = None
+        return {"ok": True, "selected": len(self.state.selected_idx)}
+
+    @pyqtSlot("QVariantList", bool, result="QVariant")
+    def selectIndices(self, indices: list[Any], additive: bool) -> dict[str, Any]:
+        if self.state.selection_mode != "point":
+            return {"ok": False, "error": "point selection is only available in point mode"}
+        valid_indices = {
+            int(idx) for idx in indices if isinstance(idx, (int, float)) and int(idx) in self.state.df.index
+        }
+        if additive:
+            self.state.selected_idx.update(valid_indices)
+        else:
+            self.state.selected_idx = valid_indices
         self.state.selected_day = None
         return {"ok": True, "selected": len(self.state.selected_idx)}
 
