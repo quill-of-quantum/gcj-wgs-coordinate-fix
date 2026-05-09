@@ -24,9 +24,10 @@ import pandas as pd
 
 try:
     from PyQt6.QtCore import QObject, pyqtSlot
+    from PyQt6.QtGui import QCloseEvent
     from PyQt6.QtWebChannel import QWebChannel
     from PyQt6.QtWebEngineWidgets import QWebEngineView
-    from PyQt6.QtWidgets import QApplication, QFileDialog
+    from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 except Exception as exc:  # pragma: no cover
     raise SystemExit(
         "PyQt6 and PyQt6-WebEngine are required. Install with: pip install PyQt6 PyQt6-WebEngine"
@@ -38,6 +39,11 @@ MODIFIED_EPSILON = 1e-9
 MAX_VIEWPORT_POINTS_POINT_MODE = 8000
 MAX_VIEWPORT_POINTS_LINE_MODE = 1500
 MAX_VIEWPORT_LINE_POINTS = 20000
+AUTO_SMOOTH_MIN_IMPROVEMENT_RATIO = 0.08
+AUTO_SMOOTH_MIN_SINGLE_DETOUR_RATIO = 1.12
+AUTO_SMOOTH_MIN_PAIR_DETOUR_RATIO = 1.10
+AUTO_SMOOTH_MAX_BALANCE_RATIO = 0.8
+AUTO_SMOOTH_STRONG_IMPROVEMENT_RATIO = 0.25
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_OUTPUT_PATH = Path("output/gps_data_manual_export.csv")
 COMMON_TIMEZONES = [
@@ -171,6 +177,12 @@ class AppState:
     view_mask: Optional[pd.Series] = None
     modified_idx: set[int] = field(default_factory=set)
     history: list[list[dict[str, Any]]] = field(default_factory=list)
+    focus_active: bool = False
+    focus_history_depth: int = 0
+    focus_selected_idx: set[int] = field(default_factory=set)
+    focus_selected_day: Optional[str] = None
+    edit_revision: int = 0
+    export_revision: int = 0
     data_revision: int = 0
     _cached_timezone_name: Optional[str] = None
     _cached_local_dt_series: Optional[pd.Series] = None
@@ -186,6 +198,12 @@ class AppState:
 
     def update_view_all(self) -> None:
         self.view_mask = pd.Series([True] * len(self.df), index=self.df.index)
+
+    def update_view_indices(self, indices: set[int]) -> None:
+        mask = pd.Series([False] * len(self.df), index=self.df.index)
+        if indices:
+            mask.loc[list(indices)] = True
+        self.view_mask = mask
 
     def tzinfo(self) -> ZoneInfo:
         return ZoneInfo(self.timezone_name)
@@ -340,6 +358,7 @@ HTML = f"""
       <div class="buttons">
         <button onclick="convertSelection('gcj2wgs')">GCJ-02 -> WGS-84</button>
         <button onclick="convertSelection('wgs2gcj')">WGS-84 -> GCJ-02</button>
+        <button class="secondary" onclick="autoSmoothSelection()">Auto Smooth</button>
       </div>
     </div>
 
@@ -347,6 +366,14 @@ HTML = f"""
       <div class="buttons">
         <button class="secondary" onclick="clearSelection()">Clear Selection</button>
         <button class="secondary" onclick="undo()">Undo</button>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="buttons">
+        <button id="focusBtn" class="secondary" onclick="enterFocus()">Focus Selected</button>
+        <button id="focusSaveBtn" class="secondary" onclick="saveFocus()">Save Focus</button>
+        <button id="focusCancelBtn" class="secondary" onclick="cancelFocus()">Cancel Focus</button>
       </div>
     </div>
 
@@ -624,6 +651,10 @@ HTML = f"""
       const isLine = !payload || payload.selection_mode === 'line';
       document.getElementById('modeLineBtn').className = isLine ? '' : 'secondary';
       document.getElementById('modePointBtn').className = isLine ? 'secondary' : '';
+      const focusActive = !!(payload && payload.focus_active);
+      document.getElementById('focusBtn').disabled = focusActive;
+      document.getElementById('focusSaveBtn').disabled = !focusActive;
+      document.getElementById('focusCancelBtn').disabled = !focusActive;
     }}
 
     function pointStyle(feature) {{
@@ -781,11 +812,55 @@ HTML = f"""
       backend.clearSelection(function() {{ refresh(false); }});
     }}
 
+    function enterFocus() {{
+      if (!backend) return;
+      backend.enterFocus(function(result) {{
+        if (result && result.error) {{
+          alert(result.error);
+          return;
+        }}
+        refresh(true);
+      }});
+    }}
+
+    function saveFocus() {{
+      if (!backend) return;
+      backend.saveFocus(function(result) {{
+        if (result && result.error) {{
+          alert(result.error);
+          return;
+        }}
+        refresh(true);
+      }});
+    }}
+
+    function cancelFocus() {{
+      if (!backend) return;
+      backend.cancelFocus(function(result) {{
+        if (result && result.error) {{
+          alert(result.error);
+          return;
+        }}
+        refresh(true);
+      }});
+    }}
+
     function convertSelection(direction) {{
       if (!backend) return;
       backend.convert(direction, function(result) {{
         if (result && result.error) {{
           alert(result.error);
+        }}
+        refresh(false);
+      }});
+    }}
+
+    function autoSmoothSelection() {{
+      if (!backend) return;
+      backend.autoSmoothSelection(function(result) {{
+        if (result && result.error) {{
+          alert(result.error);
+          return;
         }}
         refresh(false);
       }});
@@ -855,12 +930,172 @@ class Backend(QObject):
         modified = len(self.state.modified_idx)
         selected = len(self._active_selection())
         day_text = self.state.selected_day or "-"
+        focus_text = "on" if self.state.focus_active else "off"
+        export_text = "clean" if self.state.edit_revision == self.state.export_revision else "needs export"
         return (
             f"mode: {self.state.selection_mode} | timezone: {self.state.timezone_name}\n"
             f"total: {total} | modified: {modified} | selected: {selected}\n"
-            f"selected day: {day_text}\n"
+            f"selected day: {day_text} | focus: {focus_text} | export: {export_text}\n"
             f"origin db: {self.state.origin_db_path.name} | edited db: {self.state.edited_db_path.name}"
         )
+
+    def _mark_edited(self) -> None:
+        self.state.edit_revision += 1
+
+    def _segment_len(self, p0: np.ndarray, p1: np.ndarray) -> float:
+        return float(np.linalg.norm(p1 - p0))
+
+    def _point_line_distance(self, point: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
+        segment = end - start
+        seg_norm = float(np.dot(segment, segment))
+        if seg_norm < 1e-12:
+            return self._segment_len(point, start)
+        t = float(np.dot(point - start, segment) / seg_norm)
+        t = max(0.0, min(1.0, t))
+        projection = start + t * segment
+        return self._segment_len(point, projection)
+
+    def _coord_variants(self, point: np.ndarray) -> list[tuple[str, np.ndarray]]:
+        lon = float(point[0])
+        lat = float(point[1])
+        gcj_to_wgs = gcj02_to_wgs84(lon, lat)
+        wgs_to_gcj = wgs84_to_gcj02(lon, lat)
+        return [
+            ("keep", np.array([lon, lat], dtype=float)),
+            ("gcj2wgs", np.array([gcj_to_wgs[0], gcj_to_wgs[1]], dtype=float)),
+            ("wgs2gcj", np.array([wgs_to_gcj[0], wgs_to_gcj[1]], dtype=float)),
+        ]
+
+    def _single_path_sum(self, pts: np.ndarray, idx: int, candidate: np.ndarray) -> float:
+        prev_pt = pts[idx - 1]
+        next_pt = pts[idx + 1]
+        return self._segment_len(prev_pt, candidate) + self._segment_len(candidate, next_pt)
+
+    def _pair_path_sum(self, pts: np.ndarray, idx: int, cand0: np.ndarray, cand1: np.ndarray) -> float:
+        p0 = pts[idx - 1]
+        p3 = pts[idx + 2]
+        return (
+            self._segment_len(p0, cand0)
+            + self._segment_len(cand0, cand1)
+            + self._segment_len(cand1, p3)
+        )
+
+    def _edge_balance(self, edge_lengths: list[float]) -> float:
+        positive = [edge for edge in edge_lengths if edge > 1e-12]
+        if len(positive) < len(edge_lengths):
+            return float("inf")
+        mean_val = sum(positive) / len(positive)
+        if mean_val <= 1e-12:
+            return float("inf")
+        variance = sum((edge - mean_val) ** 2 for edge in positive) / len(positive)
+        return math.sqrt(variance) / mean_val
+
+    def _should_accept_single(self, pts: np.ndarray, idx: int, candidate: np.ndarray) -> bool:
+        prev_pt = pts[idx - 1]
+        cur_pt = pts[idx]
+        next_pt = pts[idx + 1]
+        baseline = self._segment_len(prev_pt, cur_pt) + self._segment_len(cur_pt, next_pt)
+        direct = self._segment_len(prev_pt, next_pt)
+        if direct < 1e-12:
+            return False
+        if baseline / direct < AUTO_SMOOTH_MIN_SINGLE_DETOUR_RATIO:
+            return False
+        new_sum = self._single_path_sum(pts, idx, candidate)
+        if baseline <= 1e-12:
+            return False
+        improvement = (baseline - new_sum) / baseline
+        baseline_balance = self._edge_balance(
+            [
+                self._segment_len(prev_pt, cur_pt),
+                self._segment_len(cur_pt, next_pt),
+            ]
+        )
+        candidate_balance = self._edge_balance(
+            [
+                self._segment_len(prev_pt, candidate),
+                self._segment_len(candidate, next_pt),
+            ]
+        )
+        if improvement < AUTO_SMOOTH_MIN_IMPROVEMENT_RATIO and candidate_balance >= baseline_balance:
+            return False
+        if (
+            candidate_balance <= baseline_balance * AUTO_SMOOTH_MAX_BALANCE_RATIO
+            and improvement > 0
+        ):
+            return True
+        current_offset = self._point_line_distance(cur_pt, prev_pt, next_pt)
+        candidate_offset = self._point_line_distance(candidate, prev_pt, next_pt)
+        if candidate_offset < current_offset and improvement >= AUTO_SMOOTH_MIN_IMPROVEMENT_RATIO:
+            return True
+        return improvement >= AUTO_SMOOTH_STRONG_IMPROVEMENT_RATIO
+
+    def _should_accept_pair(
+        self, pts: np.ndarray, idx: int, cand0: np.ndarray, cand1: np.ndarray
+    ) -> bool:
+        p0 = pts[idx - 1]
+        p1 = pts[idx]
+        p2 = pts[idx + 1]
+        p3 = pts[idx + 2]
+        baseline = self._pair_path_sum(pts, idx, p1, p2)
+        direct = self._segment_len(p0, p3)
+        if direct < 1e-12:
+            return False
+        if baseline / direct < AUTO_SMOOTH_MIN_PAIR_DETOUR_RATIO:
+            baseline_gate = False
+        else:
+            baseline_gate = True
+        new_sum = self._pair_path_sum(pts, idx, cand0, cand1)
+        if baseline <= 1e-12:
+            return False
+        improvement = (baseline - new_sum) / baseline
+        baseline_balance = self._edge_balance(
+            [
+                self._segment_len(p0, p1),
+                self._segment_len(p1, p2),
+                self._segment_len(p2, p3),
+            ]
+        )
+        candidate_balance = self._edge_balance(
+            [
+                self._segment_len(p0, cand0),
+                self._segment_len(cand0, cand1),
+                self._segment_len(cand1, p3),
+            ]
+        )
+        if not baseline_gate:
+            return (
+                improvement >= AUTO_SMOOTH_STRONG_IMPROVEMENT_RATIO
+                and candidate_balance <= baseline_balance * AUTO_SMOOTH_MAX_BALANCE_RATIO
+            )
+        if improvement < AUTO_SMOOTH_MIN_IMPROVEMENT_RATIO and candidate_balance >= baseline_balance:
+            return False
+        if candidate_balance <= baseline_balance * AUTO_SMOOTH_MAX_BALANCE_RATIO and improvement > 0:
+            return True
+        current_offset = self._point_line_distance(p1, p0, p3) + self._point_line_distance(p2, p0, p3)
+        candidate_offset = self._point_line_distance(cand0, p0, p3) + self._point_line_distance(cand1, p0, p3)
+        if candidate_offset < current_offset and improvement >= AUTO_SMOOTH_MIN_IMPROVEMENT_RATIO:
+            return True
+        return improvement >= AUTO_SMOOTH_STRONG_IMPROVEMENT_RATIO
+
+    def _undo_last_batch(self) -> dict[str, Any]:
+        if not self.state.history:
+            return {"ok": False, "error": "no history"}
+        batch = self.state.history.pop()
+        touched: set[int] = set()
+        for item in batch:
+            idx = item["idx"]
+            self.state.df.at[idx, self.state.lon_col] = item["lon"]
+            self.state.df.at[idx, self.state.lat_col] = item["lat"]
+            self.state.df.at[idx, "manual_note"] = item["note"]
+            self.state.df.at[idx, "manual_timezone"] = item["timezone"]
+            self.state.df.at[idx, "manual_mode"] = item["mode"]
+            self.state.df.at[idx, "manual_updated_at"] = item["updated_at"]
+            touched.add(idx)
+        self._update_modified_flags(touched)
+        self.state.invalidate_geometry_cache()
+        self._persist_edited_db()
+        self._mark_edited()
+        return {"ok": True, "undone": len(batch)}
 
     def _active_selection(self) -> set[int]:
         if self.state.selection_mode == "line" and self.state.selected_day:
@@ -881,11 +1116,12 @@ class Backend(QObject):
         )
 
     def _viewport_mask(self, south: float, west: float, north: float, east: float) -> pd.Series:
+        df_view = self.state.get_view_df()
         return (
-            (self.state.df[self.state.lon_col] >= west)
-            & (self.state.df[self.state.lon_col] <= east)
-            & (self.state.df[self.state.lat_col] >= south)
-            & (self.state.df[self.state.lat_col] <= north)
+            (df_view[self.state.lon_col] >= west)
+            & (df_view[self.state.lon_col] <= east)
+            & (df_view[self.state.lat_col] >= south)
+            & (df_view[self.state.lat_col] <= north)
         )
 
     def _limit_indices(self, idx_array: np.ndarray, max_count: int, keep_idx: set[int]) -> np.ndarray:
@@ -1083,20 +1319,25 @@ class Backend(QObject):
         output_df = self._build_output_df()
         output_df.to_csv(path, index=False)
         self._persist_output_db(output_df)
+        self.state.export_revision = self.state.edit_revision
         return {"ok": True, "path": str(path), "output_db": str(self.state.output_db_path)}
 
     @pyqtSlot(result="QVariant")
     def requestMeta(self) -> dict[str, Any]:
-        south = west = north = east = None
-        if self.state.data_bounds is not None:
-            south, west, north, east = self.state.data_bounds
-        center_lat = center_lon = None
         df_view = self.state.get_view_df()
+        south = west = north = east = None
+        center_lat = center_lon = None
         if not df_view.empty:
             valid = df_view[[self.state.lat_col, self.state.lon_col]].dropna()
             if not valid.empty:
+                south = float(valid[self.state.lat_col].min())
+                west = float(valid[self.state.lon_col].min())
+                north = float(valid[self.state.lat_col].max())
+                east = float(valid[self.state.lon_col].max())
                 center_lat = float(valid[self.state.lat_col].mean())
                 center_lon = float(valid[self.state.lon_col].mean())
+        elif self.state.data_bounds is not None:
+            south, west, north, east = self.state.data_bounds
         bounds_payload = None
         if None not in {south, west, north, east}:
             bounds_payload = {"south": south, "west": west, "north": north, "east": east}
@@ -1107,6 +1348,7 @@ class Backend(QObject):
             "selection_mode": self.state.selection_mode,
             "timezone_name": self.state.timezone_name,
             "status_text": self._status_text(),
+            "focus_active": self.state.focus_active,
         }
 
     def _payload_for_df(self, df_view: pd.DataFrame, zoom: float) -> dict[str, Any]:
@@ -1125,6 +1367,7 @@ class Backend(QObject):
             "status_text": self._status_text(),
             "selection_mode": self.state.selection_mode,
             "timezone_name": self.state.timezone_name,
+            "focus_active": self.state.focus_active,
         }
 
     @pyqtSlot(result="QVariant")
@@ -1136,7 +1379,8 @@ class Backend(QObject):
         self, south: float, west: float, north: float, east: float, zoom: float
     ) -> dict[str, Any]:
         viewport_mask = self._viewport_mask(south, west, north, east)
-        df_view = self.state.df[viewport_mask]
+        df_base = self.state.get_view_df()
+        df_view = df_base[viewport_mask]
         return self._payload_for_df(df_view, zoom=zoom)
 
     @pyqtSlot(str, result="QVariant")
@@ -1159,6 +1403,46 @@ class Backend(QObject):
         if self.state.selected_day is not None and self.state.dt_series is not None:
             if not self._indices_for_day(self.state.selected_day):
                 self.state.selected_day = None
+        return {"ok": True}
+
+    @pyqtSlot(result="QVariant")
+    def enterFocus(self) -> dict[str, Any]:
+        if self.state.focus_active:
+            return {"ok": False, "error": "focus mode already active"}
+        active_selection = self._active_selection()
+        if not active_selection:
+            return {"ok": False, "error": "no active selection to focus"}
+        self.state.focus_active = True
+        self.state.focus_history_depth = len(self.state.history)
+        self.state.focus_selected_idx = set(self.state.selected_idx)
+        self.state.focus_selected_day = self.state.selected_day
+        self.state.update_view_indices(active_selection)
+        return {"ok": True, "focused": len(active_selection)}
+
+    @pyqtSlot(result="QVariant")
+    def saveFocus(self) -> dict[str, Any]:
+        if not self.state.focus_active:
+            return {"ok": False, "error": "focus mode is not active"}
+        self.state.focus_active = False
+        self.state.focus_history_depth = 0
+        self.state.focus_selected_idx = set()
+        self.state.focus_selected_day = None
+        self.state.update_view_all()
+        return {"ok": True}
+
+    @pyqtSlot(result="QVariant")
+    def cancelFocus(self) -> dict[str, Any]:
+        if not self.state.focus_active:
+            return {"ok": False, "error": "focus mode is not active"}
+        while len(self.state.history) > self.state.focus_history_depth:
+            self._undo_last_batch()
+        self.state.focus_active = False
+        self.state.focus_history_depth = 0
+        self.state.selected_idx = set(self.state.focus_selected_idx)
+        self.state.selected_day = self.state.focus_selected_day
+        self.state.focus_selected_idx = set()
+        self.state.focus_selected_day = None
+        self.state.update_view_all()
         return {"ok": True}
 
     @pyqtSlot(str, result="QVariant")
@@ -1283,27 +1567,132 @@ class Backend(QObject):
         self._update_modified_flags(active_selection)
         self.state.invalidate_geometry_cache()
         self._persist_edited_db()
+        self._mark_edited()
         return {"ok": True, "converted": len(history_batch)}
 
     @pyqtSlot(result="QVariant")
-    def undo(self) -> dict[str, Any]:
-        if not self.state.history:
-            return {"ok": False, "error": "no history"}
-        batch = self.state.history.pop()
-        touched: set[int] = set()
-        for item in batch:
-            idx = item["idx"]
-            self.state.df.at[idx, self.state.lon_col] = item["lon"]
-            self.state.df.at[idx, self.state.lat_col] = item["lat"]
-            self.state.df.at[idx, "manual_note"] = item["note"]
-            self.state.df.at[idx, "manual_timezone"] = item["timezone"]
-            self.state.df.at[idx, "manual_mode"] = item["mode"]
-            self.state.df.at[idx, "manual_updated_at"] = item["updated_at"]
-            touched.add(idx)
-        self._update_modified_flags(touched)
+    def autoSmoothSelection(self) -> dict[str, Any]:
+        active_selection = sorted(self._active_selection())
+        if len(active_selection) < 5:
+            return {"ok": False, "error": "need at least 5 selected points for auto smooth"}
+
+        coord_df = self.state.df.loc[active_selection, [self.state.lon_col, self.state.lat_col]]
+        if coord_df.isna().any().any():
+            return {"ok": False, "error": "selection contains invalid coordinates"}
+
+        pts = coord_df[[self.state.lon_col, self.state.lat_col]].to_numpy(dtype=float)
+        optimized = pts.copy()
+        changed_positions: set[int] = set()
+        idx = 1
+        while idx < len(optimized) - 1:
+            best_single_name = "keep"
+            best_single_candidate = optimized[idx].copy()
+            best_single_sum = self._single_path_sum(optimized, idx, best_single_candidate)
+            for candidate_name, candidate in self._coord_variants(optimized[idx]):
+                candidate_sum = self._single_path_sum(optimized, idx, candidate)
+                if candidate_sum < best_single_sum:
+                    best_single_name = candidate_name
+                    best_single_candidate = candidate
+                    best_single_sum = candidate_sum
+            accept_single = (
+                best_single_name != "keep"
+                and self._should_accept_single(optimized, idx, best_single_candidate)
+            )
+
+            accept_pair = False
+            best_pair_names = ("keep", "keep")
+            best_pair_candidate0 = optimized[idx].copy()
+            best_pair_candidate1 = optimized[idx + 1].copy()
+            if idx < len(optimized) - 2:
+                best_pair_sum = self._pair_path_sum(
+                    optimized, idx, best_pair_candidate0, best_pair_candidate1
+                )
+                variants0 = self._coord_variants(optimized[idx])
+                variants1 = self._coord_variants(optimized[idx + 1])
+                for name0, cand0 in variants0:
+                    for name1, cand1 in variants1:
+                        pair_sum = self._pair_path_sum(optimized, idx, cand0, cand1)
+                        if pair_sum < best_pair_sum:
+                            best_pair_sum = pair_sum
+                            best_pair_names = (name0, name1)
+                            best_pair_candidate0 = cand0
+                            best_pair_candidate1 = cand1
+                accept_pair = (
+                    best_pair_names != ("keep", "keep")
+                    and self._should_accept_pair(
+                        optimized, idx, best_pair_candidate0, best_pair_candidate1
+                    )
+                )
+
+            if accept_pair and (
+                not accept_single
+                or self._pair_path_sum(optimized, idx, best_pair_candidate0, best_pair_candidate1)
+                <= best_single_sum
+            ):
+                optimized[idx] = best_pair_candidate0
+                optimized[idx + 1] = best_pair_candidate1
+                changed_positions.add(idx)
+                changed_positions.add(idx + 1)
+                idx += 2
+                continue
+
+            if accept_single:
+                optimized[idx] = best_single_candidate
+                changed_positions.add(idx)
+                idx += 1
+                continue
+
+            idx += 1
+
+        if not changed_positions:
+            return {"ok": False, "error": "auto smooth produced no editable changes"}
+
+        now_tag = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        history_batch: list[dict[str, Any]] = []
+        for pos in sorted(changed_positions):
+            idx = active_selection[pos]
+            old_lon = self.state.df.at[idx, self.state.lon_col]
+            old_lat = self.state.df.at[idx, self.state.lat_col]
+            new_lon = float(optimized[pos, 0])
+            new_lat = float(optimized[pos, 1])
+            if (
+                abs(float(old_lon) - new_lon) <= MODIFIED_EPSILON
+                and abs(float(old_lat) - new_lat) <= MODIFIED_EPSILON
+            ):
+                continue
+            history_batch.append(
+                {
+                    "idx": idx,
+                    "lon": old_lon,
+                    "lat": old_lat,
+                    "note": self.state.df.at[idx, "manual_note"],
+                    "timezone": self.state.df.at[idx, "manual_timezone"],
+                    "mode": self.state.df.at[idx, "manual_mode"],
+                    "updated_at": self.state.df.at[idx, "manual_updated_at"],
+                }
+            )
+            prev_note = self.state.df.at[idx, "manual_note"]
+            note = f"manual:AUTOCOORD@{now_tag}"
+            self.state.df.at[idx, self.state.lon_col] = new_lon
+            self.state.df.at[idx, self.state.lat_col] = new_lat
+            self.state.df.at[idx, "manual_note"] = f"{prev_note} | {note}" if prev_note else note
+            self.state.df.at[idx, "manual_timezone"] = self.state.timezone_name
+            self.state.df.at[idx, "manual_mode"] = f"{self.state.selection_mode}:autocoord"
+            self.state.df.at[idx, "manual_updated_at"] = now_tag
+
+        if not history_batch:
+            return {"ok": False, "error": "auto smooth produced no editable changes"}
+        changed_indices = {item["idx"] for item in history_batch}
+        self.state.history.append(history_batch)
+        self._update_modified_flags(changed_indices)
         self.state.invalidate_geometry_cache()
         self._persist_edited_db()
-        return {"ok": True, "undone": len(batch)}
+        self._mark_edited()
+        return {"ok": True, "smoothed": len(history_batch)}
+
+    @pyqtSlot(result="QVariant")
+    def undo(self) -> dict[str, Any]:
+        return self._undo_last_batch()
 
     @pyqtSlot(result="QVariant")
     def save(self) -> dict[str, Any]:
@@ -1323,6 +1712,27 @@ class Backend(QObject):
         export_path = Path(file_path)
         self.state.output_path = export_path
         return self._export_csv(export_path)
+
+
+class ManualEditorView(QWebEngineView):
+    def __init__(self, backend: Backend) -> None:
+        super().__init__()
+        self.backend = backend
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        state = self.backend.state
+        if state.edit_revision != state.export_revision:
+            result = QMessageBox.question(
+                self,
+                "Unexported Changes",
+                "Current edits have not been exported to CSV. Exit anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if result != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+        super().closeEvent(event)
 
 
 def load_state(input_path: Path, output_path: Optional[Path], db_dir: Optional[Path]) -> AppState:
@@ -1409,7 +1819,7 @@ def main() -> None:
     state = load_state(input_path, output_path, db_dir)
     backend = Backend(state)
 
-    view = QWebEngineView()
+    view = ManualEditorView(backend)
     channel = QWebChannel()
     channel.registerObject("backend", backend)
     view.page().setWebChannel(channel)
