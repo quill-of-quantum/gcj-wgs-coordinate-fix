@@ -33,9 +33,11 @@ except Exception as exc:  # pragma: no cover
     ) from exc
 
 
-MAX_RENDER_POINTS = 30000
 MAX_SEGMENT_DISTANCE_METERS = 1000.0
 MODIFIED_EPSILON = 1e-9
+MAX_VIEWPORT_POINTS_POINT_MODE = 8000
+MAX_VIEWPORT_POINTS_LINE_MODE = 1500
+MAX_VIEWPORT_LINE_POINTS = 20000
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_OUTPUT_PATH = Path("output/gps_data_manual_export.csv")
 COMMON_TIMEZONES = [
@@ -161,6 +163,7 @@ class AppState:
     origin_db_path: Path
     edited_db_path: Path
     output_db_path: Path
+    data_bounds: Optional[tuple[float, float, float, float]] = None
     selection_mode: str = "line"
     timezone_name: str = DEFAULT_TIMEZONE
     selected_idx: set[int] = field(default_factory=set)
@@ -168,6 +171,13 @@ class AppState:
     view_mask: Optional[pd.Series] = None
     modified_idx: set[int] = field(default_factory=set)
     history: list[list[dict[str, Any]]] = field(default_factory=list)
+    data_revision: int = 0
+    _cached_timezone_name: Optional[str] = None
+    _cached_local_dt_series: Optional[pd.Series] = None
+    _cached_local_day_series: Optional[pd.Series] = None
+    _cached_day_to_indices: Optional[dict[str, set[int]]] = None
+    _cached_route_key: Optional[tuple[Any, ...]] = None
+    _cached_route_segments: Optional[list[dict[str, Any]]] = None
 
     def get_view_df(self) -> pd.DataFrame:
         if self.view_mask is None:
@@ -180,16 +190,54 @@ class AppState:
     def tzinfo(self) -> ZoneInfo:
         return ZoneInfo(self.timezone_name)
 
+    def invalidate_time_cache(self) -> None:
+        self._cached_timezone_name = None
+        self._cached_local_dt_series = None
+        self._cached_local_day_series = None
+        self._cached_day_to_indices = None
+        self._cached_route_key = None
+        self._cached_route_segments = None
+
+    def invalidate_geometry_cache(self) -> None:
+        self.data_revision += 1
+        self._cached_route_key = None
+        self._cached_route_segments = None
+
     def local_dt_series(self) -> Optional[pd.Series]:
         if self.dt_series is None:
             return None
-        return self.dt_series.dt.tz_convert(self.tzinfo())
+        if (
+            self._cached_local_dt_series is None
+            or self._cached_timezone_name != self.timezone_name
+        ):
+            self._cached_local_dt_series = self.dt_series.dt.tz_convert(self.tzinfo())
+            self._cached_timezone_name = self.timezone_name
+            self._cached_local_day_series = None
+            self._cached_day_to_indices = None
+        return self._cached_local_dt_series
 
     def local_day_series(self) -> Optional[pd.Series]:
-        local_dt = self.local_dt_series()
-        if local_dt is None:
+        if self.dt_series is None:
             return None
-        return local_dt.dt.strftime("%Y-%m-%d")
+        if self._cached_local_day_series is None:
+            local_dt = self.local_dt_series()
+            if local_dt is None:
+                return None
+            self._cached_local_day_series = local_dt.dt.strftime("%Y-%m-%d")
+            self._cached_day_to_indices = None
+        return self._cached_local_day_series
+
+    def day_to_indices(self) -> Optional[dict[str, set[int]]]:
+        day_series = self.local_day_series()
+        if day_series is None:
+            return None
+        if self._cached_day_to_indices is None:
+            valid = day_series.dropna()
+            groups = valid.groupby(valid, sort=False).groups
+            self._cached_day_to_indices = {
+                str(day): set(indexes.tolist()) for day, indexes in groups.items()
+            }
+        return self._cached_day_to_indices
 
 
 HTML = f"""
@@ -200,7 +248,6 @@ HTML = f"""
   <title>Manual GPS Repair</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
   <style>
     html, body {{ height: 100%; margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
     #map {{ height: 100%; width: 100%; }}
@@ -246,6 +293,10 @@ HTML = f"""
       border-radius: 8px;
       padding: 8px;
       white-space: pre-line;
+    }}
+    .map-box-select {{
+      background: rgba(37, 99, 235, 0.10);
+      border: 2px solid rgba(37, 99, 235, 0.9);
     }}
   </style>
 </head>
@@ -301,13 +352,12 @@ HTML = f"""
     <div class="row status" id="statusText"></div>
     <div class="hint">
       Line repair: click any line or point to select that local day.<br>
-      Point repair: draw a rectangle or use Cmd/Ctrl + click for multi-select.
+      Point repair: hold Cmd/Ctrl and drag with left mouse to box-select, or Cmd/Ctrl + click for multi-select.
     </div>
   </div>
 
   <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
   <script>
     const map = L.map('map', {{ preferCanvas: true }});
     L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
@@ -320,25 +370,124 @@ HTML = f"""
     let lineLayers = [];
     let currentPayload = null;
     let hasFitBounds = false;
-
-    const drawnItems = new L.FeatureGroup();
-    map.addLayer(drawnItems);
-    const drawControl = new L.Control.Draw({{
-      draw: {{
-        polygon: false,
-        polyline: false,
-        circle: false,
-        marker: false,
-        circlemarker: false,
-        rectangle: true
-      }},
-      edit: {{ featureGroup: drawnItems, edit: false, remove: true }}
-    }});
-    map.addControl(drawControl);
+    let modifierPressed = false;
+    let boxSelecting = false;
+    let boxMoved = false;
+    let boxStartPoint = null;
+    let boxRect = null;
+    let suppressNextClick = false;
+    let refreshTimer = null;
 
     function setStatus(text) {{
       document.getElementById('statusText').textContent = text || '';
     }}
+
+    function isPointMode() {{
+      return currentPayload && currentPayload.selection_mode === 'point';
+    }}
+
+    function clearBoxRect() {{
+      if (boxRect) {{
+        map.removeLayer(boxRect);
+        boxRect = null;
+      }}
+    }}
+
+    function enableMapDragging() {{
+      if (map.dragging && !map.dragging.enabled()) {{
+        map.dragging.enable();
+      }}
+    }}
+
+    function disableMapDragging() {{
+      if (map.dragging && map.dragging.enabled()) {{
+        map.dragging.disable();
+      }}
+    }}
+
+    function updateModifierState(event, isDown) {{
+      modifierPressed = isDown || !!(event.metaKey || event.ctrlKey);
+      if (!modifierPressed && !boxSelecting) {{
+        enableMapDragging();
+      }}
+    }}
+
+    document.addEventListener('keydown', function(event) {{
+      updateModifierState(event, true);
+    }});
+
+    document.addEventListener('keyup', function(event) {{
+      updateModifierState(event, false);
+    }});
+
+    window.addEventListener('blur', function() {{
+      modifierPressed = false;
+      if (!boxSelecting) {{
+        enableMapDragging();
+      }}
+    }});
+
+    function startBoxSelection(event) {{
+      if (!backend || !isPointMode()) return;
+      if (!(event.originalEvent.metaKey || event.originalEvent.ctrlKey)) return;
+      if (event.originalEvent.button !== 0) return;
+      boxSelecting = true;
+      boxMoved = false;
+      boxStartPoint = event.containerPoint;
+      suppressNextClick = false;
+      disableMapDragging();
+      clearBoxRect();
+      L.DomEvent.stop(event.originalEvent);
+    }}
+
+    function updateBoxSelection(event) {{
+      if (!boxSelecting || !boxStartPoint) return;
+      const currentPoint = event.containerPoint;
+      const dx = currentPoint.x - boxStartPoint.x;
+      const dy = currentPoint.y - boxStartPoint.y;
+      if (!boxMoved && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) {{
+        boxMoved = true;
+      }}
+      const startLatLng = map.containerPointToLatLng(boxStartPoint);
+      const endLatLng = map.containerPointToLatLng(currentPoint);
+      const bounds = L.latLngBounds(startLatLng, endLatLng);
+      if (!boxRect) {{
+        boxRect = L.rectangle(bounds, {{ className: 'map-box-select', weight: 2, fillOpacity: 0.10 }});
+        boxRect.addTo(map);
+      }} else {{
+        boxRect.setBounds(bounds);
+      }}
+    }}
+
+    function finishBoxSelection(event) {{
+      if (!boxSelecting) return;
+      boxSelecting = false;
+      enableMapDragging();
+      if (!boxMoved || !boxRect || !backend || !isPointMode()) {{
+        clearBoxRect();
+        boxStartPoint = null;
+        return;
+      }}
+      suppressNextClick = true;
+      const bounds = boxRect.getBounds();
+      clearBoxRect();
+      boxStartPoint = null;
+      backend.selectBounds(
+        bounds.getSouth(), bounds.getWest(), bounds.getNorth(), bounds.getEast(),
+        function() {{ refresh(false); }}
+      );
+      if (event && event.originalEvent) {{
+        L.DomEvent.stop(event.originalEvent);
+      }}
+    }}
+
+    document.addEventListener('mouseup', function(event) {{
+      if (!boxSelecting) return;
+      const rect = map.getContainer().getBoundingClientRect();
+      const containerPoint = L.point(event.clientX - rect.left, event.clientY - rect.top);
+      updateBoxSelection({{ containerPoint }});
+      finishBoxSelection({{ originalEvent: event }});
+    }});
 
     function syncControls(payload) {{
       currentPayload = payload || null;
@@ -385,7 +534,6 @@ HTML = f"""
       }}
 
       const segments = payload.route_segments || [];
-      const allLatLngs = [];
       segments.forEach(seg => {{
         const coords = seg.coords || [];
         if (coords.length < 2) return;
@@ -400,7 +548,6 @@ HTML = f"""
         }});
         line.addTo(map);
         lineLayers.push(line);
-        coords.forEach(c => allLatLngs.push(c));
       }});
 
       const geojson = payload.point_features || {{ type: 'FeatureCollection', features: [] }};
@@ -410,6 +557,10 @@ HTML = f"""
         }},
         onEachFeature: function(feature, layer) {{
           layer.on('click', function(event) {{
+            if (suppressNextClick) {{
+              suppressNextClick = false;
+              return;
+            }}
             if (!backend) return;
             const props = feature.properties || {{}};
             if ((payload.selection_mode || 'line') === 'line') {{
@@ -433,28 +584,45 @@ HTML = f"""
         }}
       }}).addTo(map);
 
-      geojson.features.forEach(feature => {{
-        if (feature.geometry && feature.geometry.coordinates) {{
-          const c = feature.geometry.coordinates;
-          allLatLngs.push([c[1], c[0]]);
-        }}
-      }});
-
-      if (!hasFitBounds && allLatLngs.length) {{
-        map.fitBounds(L.latLngBounds(allLatLngs), {{ padding: [30, 30] }});
-        hasFitBounds = true;
-      }} else if (!hasFitBounds && payload.center_lat !== null && payload.center_lon !== null) {{
-        map.setView([payload.center_lat, payload.center_lon], 12);
-      }}
     }}
 
     function refresh(resetBounds = false) {{
-      if (resetBounds) {{
-        hasFitBounds = false;
-      }}
       if (!backend) return;
-      backend.requestData(function(payload) {{
+      if (resetBounds) {{
+        refreshFromMeta();
+        return;
+      }}
+      const bounds = map.getBounds();
+      backend.requestDataForViewport(
+        bounds.getSouth(), bounds.getWest(), bounds.getNorth(), bounds.getEast(),
+        function(payload) {{
         renderData(payload);
+        }}
+      );
+    }}
+
+    function scheduleRefresh() {{
+      if (refreshTimer) {{
+        clearTimeout(refreshTimer);
+      }}
+      refreshTimer = setTimeout(function() {{
+        refresh(false);
+      }}, 120);
+    }}
+
+    function refreshFromMeta() {{
+      if (!backend) return;
+      backend.requestMeta(function(meta) {{
+        if (!meta) return;
+        if (meta.data_bounds) {{
+          const b = meta.data_bounds;
+          map.fitBounds([[b.south, b.west], [b.north, b.east]], {{ padding: [30, 30] }});
+          hasFitBounds = true;
+        }} else if (meta.center_lat !== null && meta.center_lon !== null) {{
+          map.setView([meta.center_lat, meta.center_lon], 12);
+          hasFitBounds = true;
+        }}
+        refresh(false);
       }});
     }}
 
@@ -462,6 +630,10 @@ HTML = f"""
       if (!backend) return;
       backend.setMode(mode, function(result) {{
         if (result && result.error) alert(result.error);
+        clearBoxRect();
+        boxSelecting = false;
+        boxStartPoint = null;
+        enableMapDragging();
         refresh(false);
       }});
     }}
@@ -528,24 +700,21 @@ HTML = f"""
       }});
     }}
 
-    map.on(L.Draw.Event.CREATED, function(e) {{
-      drawnItems.clearLayers();
-      drawnItems.addLayer(e.layer);
-      if (!backend) return;
-      if (currentPayload && currentPayload.selection_mode !== 'point') {{
-        alert('Rectangle selection is only enabled in point repair mode.');
-        return;
-      }}
-      const bounds = e.layer.getBounds();
-      backend.selectBounds(
-        bounds.getSouth(), bounds.getWest(), bounds.getNorth(), bounds.getEast(),
-        function() {{ refresh(false); }}
-      );
+    map.on('mousedown', startBoxSelection);
+    map.on('mousemove', updateBoxSelection);
+    map.on('mouseup', finishBoxSelection);
+    map.on('moveend', function() {{
+      if (!backend || !hasFitBounds || boxSelecting) return;
+      scheduleRefresh();
+    }});
+    map.on('zoomend', function() {{
+      if (!backend || !hasFitBounds || boxSelecting) return;
+      scheduleRefresh();
     }});
 
     new QWebChannel(qt.webChannelTransport, function(channel) {{
       backend = channel.objects.backend;
-      refresh(true);
+      refreshFromMeta();
     }});
   </script>
 </body>
@@ -576,10 +745,10 @@ class Backend(QObject):
         return set(self.state.selected_idx)
 
     def _indices_for_day(self, day: str) -> set[int]:
-        day_series = self.state.local_day_series()
-        if day_series is None:
+        day_map = self.state.day_to_indices()
+        if day_map is None:
             return set(self.state.df.index) if day else set()
-        return set(day_series[day_series == day].index.tolist())
+        return set(day_map.get(day, set()))
 
     def _is_modified(self, idx: int) -> bool:
         row = self.state.df.loc[idx]
@@ -588,18 +757,46 @@ class Backend(QObject):
             or abs(float(row[self.state.lat_col]) - float(row["_orig_lat"])) > MODIFIED_EPSILON
         )
 
+    def _viewport_mask(self, south: float, west: float, north: float, east: float) -> pd.Series:
+        return (
+            (self.state.df[self.state.lon_col] >= west)
+            & (self.state.df[self.state.lon_col] <= east)
+            & (self.state.df[self.state.lat_col] >= south)
+            & (self.state.df[self.state.lat_col] <= north)
+        )
+
+    def _limit_indices(self, idx_array: np.ndarray, max_count: int, keep_idx: set[int]) -> np.ndarray:
+        if len(idx_array) <= max_count:
+            return idx_array
+        keep = np.array([idx for idx in idx_array if int(idx) in keep_idx], dtype=idx_array.dtype)
+        if len(keep) >= max_count:
+            keep_sample = _sample_indices(len(keep), max_count)
+            return keep[keep_sample]
+        remaining = np.array([idx for idx in idx_array if int(idx) not in keep_idx], dtype=idx_array.dtype)
+        extra_needed = max_count - len(keep)
+        if extra_needed > 0 and len(remaining) > extra_needed:
+            remaining = remaining[_sample_indices(len(remaining), extra_needed)]
+        return np.concatenate([keep, remaining])
+
     def _serialize_points(self, df_view: pd.DataFrame) -> dict[str, Any]:
         features: list[dict[str, Any]] = []
         idx_list = df_view.index.to_numpy()
-        sample_idx = _sample_indices(len(idx_list), MAX_RENDER_POINTS)
         local_day_series = self.state.local_day_series()
         local_dt_series = self.state.local_dt_series()
         active_selection = self._active_selection()
-        for i in sample_idx:
-            idx = int(idx_list[i])
-            row = df_view.loc[idx]
-            lon = row[self.state.lon_col]
-            lat = row[self.state.lat_col]
+        max_points = (
+            MAX_VIEWPORT_POINTS_POINT_MODE
+            if self.state.selection_mode == "point"
+            else MAX_VIEWPORT_POINTS_LINE_MODE
+        )
+        sampled_indices = self._limit_indices(idx_list, max_points, active_selection)
+        sampled_df = self.state.df.loc[sampled_indices, [self.state.lon_col, self.state.lat_col]]
+        lon_values = sampled_df[self.state.lon_col].to_numpy()
+        lat_values = sampled_df[self.state.lat_col].to_numpy()
+        for pos, idx_raw in enumerate(sampled_indices):
+            idx = int(idx_raw)
+            lon = lon_values[pos]
+            lat = lat_values[pos]
             if pd.isna(lon) or pd.isna(lat):
                 continue
             local_day = ""
@@ -629,41 +826,74 @@ class Backend(QObject):
     def _route_segments(self, df_view: pd.DataFrame) -> list[dict[str, Any]]:
         if df_view.empty:
             return []
-
-        segments: list[dict[str, Any]] = []
-        local_day_series = self.state.local_day_series()
-        if local_day_series is None:
-            day_groups = [("all", df_view.index.tolist())]
+        if len(df_view):
+            first_idx = int(df_view.index[0])
+            last_idx = int(df_view.index[-1])
         else:
-            day_frame = pd.DataFrame({"day": local_day_series.loc[df_view.index]}, index=df_view.index)
-            day_frame = day_frame.dropna(subset=["day"])
-            day_groups = list(day_frame.groupby("day", sort=False).groups.items())
+            first_idx = last_idx = -1
+        cache_key = (
+            self.state.timezone_name,
+            self.state.data_revision,
+            len(df_view),
+            first_idx,
+            last_idx,
+        )
+        if self.state._cached_route_key != cache_key or self.state._cached_route_segments is None:
+            segments: list[dict[str, Any]] = []
+            local_day_series = self.state.local_day_series()
+            if local_day_series is None:
+                day_groups = [("all", df_view.index.to_numpy())]
+            else:
+                day_values = local_day_series.loc[df_view.index]
+                valid_mask = day_values.notna().to_numpy()
+                valid_indices = df_view.index.to_numpy()[valid_mask]
+                valid_days = day_values.to_numpy()[valid_mask]
+                day_groups = []
+                if len(valid_indices):
+                    start = 0
+                    current_day = valid_days[0]
+                    for pos in range(1, len(valid_indices)):
+                        if valid_days[pos] != current_day:
+                            day_groups.append((str(current_day), valid_indices[start:pos]))
+                            start = pos
+                            current_day = valid_days[pos]
+                    day_groups.append((str(current_day), valid_indices[start:]))
 
-        for day, idxs in day_groups:
-            selected = self.state.selected_day == day
-            current: list[list[float]] = []
-            prev_lat = prev_lon = None
-            sampled = _sample_indices(len(idxs), MAX_RENDER_POINTS)
-            ordered_idxs = [idxs[i] for i in sampled]
-            for idx in ordered_idxs:
-                row = self.state.df.loc[idx]
-                lon = row[self.state.lon_col]
-                lat = row[self.state.lat_col]
-                if pd.isna(lon) or pd.isna(lat):
-                    continue
-                lat_f = float(lat)
-                lon_f = float(lon)
-                if prev_lat is not None:
-                    gap = _haversine_m(prev_lat, prev_lon, lat_f, lon_f)
-                    if gap > MAX_SEGMENT_DISTANCE_METERS:
-                        if len(current) >= 2:
-                            segments.append({"day": str(day), "selected": selected, "coords": current})
-                        current = []
-                current.append([lat_f, lon_f])
-                prev_lat, prev_lon = lat_f, lon_f
-            if len(current) >= 2:
-                segments.append({"day": str(day), "selected": selected, "coords": current})
-        return segments
+            for day, idxs in day_groups:
+                current: list[list[float]] = []
+                prev_lat = prev_lon = None
+                ordered_idxs = idxs
+                if len(ordered_idxs) > MAX_VIEWPORT_LINE_POINTS:
+                    ordered_idxs = ordered_idxs[_sample_indices(len(ordered_idxs), MAX_VIEWPORT_LINE_POINTS)]
+                coord_df = self.state.df.loc[ordered_idxs, [self.state.lon_col, self.state.lat_col]]
+                lon_values = coord_df[self.state.lon_col].to_numpy()
+                lat_values = coord_df[self.state.lat_col].to_numpy()
+                for pos in range(len(ordered_idxs)):
+                    lon = lon_values[pos]
+                    lat = lat_values[pos]
+                    if pd.isna(lon) or pd.isna(lat):
+                        continue
+                    lat_f = float(lat)
+                    lon_f = float(lon)
+                    if prev_lat is not None:
+                        gap = _haversine_m(prev_lat, prev_lon, lat_f, lon_f)
+                        if gap > MAX_SEGMENT_DISTANCE_METERS:
+                            if len(current) >= 2:
+                                segments.append({"day": str(day), "coords": current})
+                            current = []
+                    current.append([lat_f, lon_f])
+                    prev_lat, prev_lon = lat_f, lon_f
+                if len(current) >= 2:
+                    segments.append({"day": str(day), "coords": current})
+
+            self.state._cached_route_key = cache_key
+            self.state._cached_route_segments = segments
+
+        selected_day = self.state.selected_day
+        return [
+            {"day": seg["day"], "coords": seg["coords"], "selected": seg["day"] == selected_day}
+            for seg in self.state._cached_route_segments
+        ]
 
     def _update_modified_flags(self, indices: set[int]) -> None:
         for idx in indices:
@@ -724,8 +954,30 @@ class Backend(QObject):
         return {"ok": True, "path": str(path), "output_db": str(self.state.output_db_path)}
 
     @pyqtSlot(result="QVariant")
-    def requestData(self) -> dict[str, Any]:
+    def requestMeta(self) -> dict[str, Any]:
+        south = west = north = east = None
+        if self.state.data_bounds is not None:
+            south, west, north, east = self.state.data_bounds
+        center_lat = center_lon = None
         df_view = self.state.get_view_df()
+        if not df_view.empty:
+            valid = df_view[[self.state.lat_col, self.state.lon_col]].dropna()
+            if not valid.empty:
+                center_lat = float(valid[self.state.lat_col].mean())
+                center_lon = float(valid[self.state.lon_col].mean())
+        bounds_payload = None
+        if None not in {south, west, north, east}:
+            bounds_payload = {"south": south, "west": west, "north": north, "east": east}
+        return {
+            "center_lat": center_lat,
+            "center_lon": center_lon,
+            "data_bounds": bounds_payload,
+            "selection_mode": self.state.selection_mode,
+            "timezone_name": self.state.timezone_name,
+            "status_text": self._status_text(),
+        }
+
+    def _payload_for_df(self, df_view: pd.DataFrame) -> dict[str, Any]:
         center_lat = center_lon = None
         if not df_view.empty:
             valid = df_view[[self.state.lat_col, self.state.lon_col]].dropna()
@@ -741,6 +993,16 @@ class Backend(QObject):
             "selection_mode": self.state.selection_mode,
             "timezone_name": self.state.timezone_name,
         }
+
+    @pyqtSlot(result="QVariant")
+    def requestData(self) -> dict[str, Any]:
+        return self._payload_for_df(self.state.get_view_df())
+
+    @pyqtSlot(float, float, float, float, result="QVariant")
+    def requestDataForViewport(self, south: float, west: float, north: float, east: float) -> dict[str, Any]:
+        viewport_mask = self._viewport_mask(south, west, north, east)
+        df_view = self.state.df[viewport_mask]
+        return self._payload_for_df(df_view)
 
     @pyqtSlot(str, result="QVariant")
     def setMode(self, mode: str) -> dict[str, Any]:
@@ -758,6 +1020,7 @@ class Backend(QObject):
         except Exception:
             return {"ok": False, "error": f"invalid timezone: {timezone_name}"}
         self.state.timezone_name = timezone_name
+        self.state.invalidate_time_cache()
         if self.state.selected_day is not None and self.state.dt_series is not None:
             if not self._indices_for_day(self.state.selected_day):
                 self.state.selected_day = None
@@ -869,6 +1132,7 @@ class Backend(QObject):
             return {"ok": False, "error": "no valid coordinates in selection"}
         self.state.history.append(history_batch)
         self._update_modified_flags(active_selection)
+        self.state.invalidate_geometry_cache()
         self._persist_edited_db()
         return {"ok": True, "converted": len(history_batch)}
 
@@ -888,6 +1152,7 @@ class Backend(QObject):
             self.state.df.at[idx, "manual_updated_at"] = item["updated_at"]
             touched.add(idx)
         self._update_modified_flags(touched)
+        self.state.invalidate_geometry_cache()
         self._persist_edited_db()
         return {"ok": True, "undone": len(batch)}
 
@@ -936,6 +1201,16 @@ def load_state(input_path: Path, output_path: Optional[Path], db_dir: Optional[P
     if "manual_updated_at" not in df.columns:
         df["manual_updated_at"] = ""
 
+    valid_coords = df[[lat_col, lon_col]].dropna()
+    data_bounds = None
+    if not valid_coords.empty:
+        data_bounds = (
+            float(valid_coords[lat_col].min()),
+            float(valid_coords[lon_col].min()),
+            float(valid_coords[lat_col].max()),
+            float(valid_coords[lon_col].max()),
+        )
+
     stem = input_path.stem
     store_dir = db_dir or Path("data/manual_store") / stem
     state = AppState(
@@ -951,6 +1226,7 @@ def load_state(input_path: Path, output_path: Optional[Path], db_dir: Optional[P
         origin_db_path=store_dir / "origin.db",
         edited_db_path=store_dir / "edited.db",
         output_db_path=store_dir / "output.db",
+        data_bounds=data_bounds,
     )
     state.update_view_all()
 
