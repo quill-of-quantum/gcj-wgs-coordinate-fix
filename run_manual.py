@@ -44,6 +44,13 @@ AUTO_SMOOTH_MIN_SINGLE_DETOUR_RATIO = 1.12
 AUTO_SMOOTH_MIN_PAIR_DETOUR_RATIO = 1.10
 AUTO_SMOOTH_MAX_BALANCE_RATIO = 0.8
 AUTO_SMOOTH_STRONG_IMPROVEMENT_RATIO = 0.25
+AUTO_REPAIR_JUMP_DETECT_THRESHOLD = 50.0
+AUTO_REPAIR_SMOOTH_THRESHOLD = 800.0
+AUTO_REPAIR_MIN_IMPROVEMENT = 4.0
+AUTO_REPAIR_AMBIGUOUS_THRESHOLD = 120.0
+AUTO_REPAIR_LOOKAHEAD_GAIN = 20.0
+AUTO_REPAIR_SHARP_TURN_DEG = 60.0
+AUTO_REPAIR_SHARP_GAIN_MULTIPLIER = 50.0
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_OUTPUT_PATH = Path("output/gps_data_manual_export.csv")
 COMMON_TIMEZONES = [
@@ -407,8 +414,10 @@ HTML = f"""
     }}).addTo(map);
 
     let backend = null;
-    let pointsLayer = null;
-    let lineLayers = [];
+    let pointLayerMap = new Map();
+    let lineLayerMap = new Map();
+    const pointLayerGroup = L.layerGroup().addTo(map);
+    const lineLayerGroup = L.layerGroup().addTo(map);
     let currentPayload = null;
     let hasFitBounds = false;
     let modifierPressed = false;
@@ -677,70 +686,118 @@ HTML = f"""
       }};
     }}
 
-    function renderData(payload) {{
-      syncControls(payload);
-      setStatus(payload.status_text || '');
+    function lineStyle(seg) {{
+      return {{
+        color: seg.selected ? '#f97316' : '#2563eb',
+        weight: seg.selected ? 5 : 3,
+        opacity: seg.selected ? 0.95 : 0.72
+      }};
+    }}
 
-      if (pointsLayer) {{
-        map.removeLayer(pointsLayer);
-        pointsLayer = null;
-      }}
-      if (lineLayers.length) {{
-        lineLayers.forEach(layer => map.removeLayer(layer));
-        lineLayers = [];
-      }}
+    function featureTooltip(props) {{
+      return [
+        `idx: ${{props.idx}}`,
+        props.local_time ? `time: ${{props.local_time}}` : null,
+        props.local_day ? `day: ${{props.local_day}}` : null,
+        props.modified ? 'modified' : null,
+      ].filter(Boolean).join('\\n');
+    }}
 
-      const segments = payload.route_segments || [];
+    function updateLineLayers(segments) {{
+      const nextIds = new Set();
       segments.forEach(seg => {{
         const coords = seg.coords || [];
         if (coords.length < 2) return;
-        const line = L.polyline(coords, {{
-          color: seg.selected ? '#f97316' : '#2563eb',
-          weight: seg.selected ? 5 : 3,
-          opacity: seg.selected ? 0.95 : 0.72
-        }});
-        line.on('click', function() {{
-          if (!backend) return;
-          backend.selectDay(seg.day, function() {{ refresh(false); }});
-        }});
-        line.addTo(map);
-        lineLayers.push(line);
+        const segId = seg.seg_id || `${{seg.day}}:${{coords.length}}`;
+        nextIds.add(segId);
+        let line = lineLayerMap.get(segId);
+        if (!line) {{
+          line = L.polyline(coords, lineStyle(seg));
+          line.on('click', function() {{
+            if (!backend) return;
+            backend.selectDay(seg.day, function() {{ refresh(false); }});
+          }});
+          line.segId = segId;
+          line.segDay = seg.day;
+          line.addTo(lineLayerGroup);
+          lineLayerMap.set(segId, line);
+        }} else {{
+          line.setLatLngs(coords);
+          line.setStyle(lineStyle(seg));
+          line.segDay = seg.day;
+        }}
       }});
+      Array.from(lineLayerMap.keys()).forEach(segId => {{
+        if (nextIds.has(segId)) return;
+        const line = lineLayerMap.get(segId);
+        if (line) {{
+          lineLayerGroup.removeLayer(line);
+          lineLayerMap.delete(segId);
+        }}
+      }});
+    }}
 
-      const geojson = payload.point_features || {{ type: 'FeatureCollection', features: [] }};
-      currentRenderedFeatures = geojson.features || [];
-      pointsLayer = L.geoJSON(geojson, {{
-        pointToLayer: function(feature, latlng) {{
-          return L.circleMarker(latlng, pointStyle(feature));
-        }},
-        onEachFeature: function(feature, layer) {{
+    function updatePointLayers(features, payload) {{
+      const nextIds = new Set();
+      features.forEach(feature => {{
+        const props = feature.properties || {{}};
+        const geom = feature.geometry || {{}};
+        const coords = geom.coordinates || null;
+        if (!coords || coords.length < 2) return;
+        const pointId = props.idx;
+        nextIds.add(pointId);
+        const latlng = [coords[1], coords[0]];
+        let layer = pointLayerMap.get(pointId);
+        if (!layer) {{
+          layer = L.circleMarker(latlng, pointStyle(feature));
           layer.on('click', function(event) {{
             if (suppressNextClick) {{
               suppressNextClick = false;
               return;
             }}
             if (!backend) return;
-            const props = feature.properties || {{}};
+            const layerProps = layer.featureProps || {{}};
             if ((payload.selection_mode || 'line') === 'line') {{
-              backend.selectDay(props.local_day || '', function() {{ refresh(false); }});
+              backend.selectDay(layerProps.local_day || '', function() {{ refresh(false); }});
               return;
             }}
             const e = event.originalEvent || {{}};
             const additive = !!(e.metaKey || e.ctrlKey);
-            backend.togglePointSelection(props.idx, additive, function() {{ refresh(false); }});
+            backend.togglePointSelection(layerProps.idx, additive, function() {{ refresh(false); }});
           }});
-          const props = feature.properties || {{}};
-          const lines = [
-            `idx: ${{props.idx}}`,
-            props.local_time ? `time: ${{props.local_time}}` : null,
-            props.local_day ? `day: ${{props.local_day}}` : null,
-            props.modified ? 'modified' : null,
-          ].filter(Boolean);
-          if (lines.length) {{
-            layer.bindTooltip(lines.join('\\n'));
+          layer.addTo(pointLayerGroup);
+          pointLayerMap.set(pointId, layer);
+        }}
+        layer.setLatLng(latlng);
+        layer.setStyle(pointStyle(feature));
+        layer.featureProps = props;
+        const tooltipText = featureTooltip(props);
+        if (tooltipText) {{
+          if (layer.getTooltip()) {{
+            layer.setTooltipContent(tooltipText);
+          }} else {{
+            layer.bindTooltip(tooltipText);
           }}
         }}
-      }}).addTo(map);
+      }});
+      Array.from(pointLayerMap.keys()).forEach(pointId => {{
+        if (nextIds.has(pointId)) return;
+        const layer = pointLayerMap.get(pointId);
+        if (layer) {{
+          pointLayerGroup.removeLayer(layer);
+          pointLayerMap.delete(pointId);
+        }}
+      }});
+    }}
+
+    function renderData(payload) {{
+      syncControls(payload);
+      setStatus(payload.status_text || '');
+      const segments = payload.route_segments || [];
+      updateLineLayers(segments);
+      const geojson = payload.point_features || {{ type: 'FeatureCollection', features: [] }};
+      currentRenderedFeatures = geojson.features || [];
+      updatePointLayers(currentRenderedFeatures, payload);
 
     }}
 
@@ -803,7 +860,7 @@ HTML = f"""
         if (result && result.error) {{
           alert(result.error);
         }}
-        refresh(true);
+        refresh(false);
       }});
     }}
 
@@ -819,7 +876,7 @@ HTML = f"""
           alert(result.error);
           return;
         }}
-        refresh(true);
+        refresh(false);
       }});
     }}
 
@@ -830,7 +887,7 @@ HTML = f"""
           alert(result.error);
           return;
         }}
-        refresh(true);
+        refresh(false);
       }});
     }}
 
@@ -841,7 +898,7 @@ HTML = f"""
           alert(result.error);
           return;
         }}
-        refresh(true);
+        refresh(false);
       }});
     }}
 
@@ -944,6 +1001,28 @@ class Backend(QObject):
 
     def _segment_len(self, p0: np.ndarray, p1: np.ndarray) -> float:
         return float(np.linalg.norm(p1 - p0))
+
+    def _geo_distance_m(self, lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+        r = 6371000.0
+        phi1, phi2 = math.radians(lat1), math.radians(lat2)
+        dphi = math.radians(lat2 - lat1)
+        dlambda = math.radians(lon2 - lon1)
+        a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+        return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    def _turning_angle(self, p1: tuple[float, float], p2: tuple[float, float], p3: tuple[float, float]) -> float:
+        lat_mid = p2[1]
+        cos_lat = math.cos(math.radians(lat_mid))
+        v1 = np.array([(p2[0] - p1[0]) * cos_lat, p2[1] - p1[1]], dtype=float)
+        v2 = np.array([(p3[0] - p2[0]) * cos_lat, p3[1] - p2[1]], dtype=float)
+        norm1 = float(np.linalg.norm(v1))
+        norm2 = float(np.linalg.norm(v2))
+        if norm1 == 0.0 or norm2 == 0.0:
+            return 180.0
+        cos_theta = float(np.dot(v1, v2) / (norm1 * norm2))
+        cos_theta = max(-1.0, min(1.0, cos_theta))
+        angle_math = math.degrees(math.acos(cos_theta))
+        return 180.0 - angle_math
 
     def _point_line_distance(self, point: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
         segment = end - start
@@ -1230,6 +1309,7 @@ class Backend(QObject):
             for day, idxs in day_groups:
                 current: list[list[float]] = []
                 prev_lat = prev_lon = None
+                day_segment_idx = 0
                 ordered_idxs = idxs
                 if len(ordered_idxs) > max_line_points:
                     ordered_idxs = ordered_idxs[_sample_indices(len(ordered_idxs), max_line_points)]
@@ -1247,12 +1327,25 @@ class Backend(QObject):
                         gap = _haversine_m(prev_lat, prev_lon, lat_f, lon_f)
                         if gap > MAX_SEGMENT_DISTANCE_METERS:
                             if len(current) >= 2:
-                                segments.append({"day": str(day), "coords": current})
+                                segments.append(
+                                    {
+                                        "seg_id": f"{day}:{day_segment_idx}",
+                                        "day": str(day),
+                                        "coords": current,
+                                    }
+                                )
+                                day_segment_idx += 1
                             current = []
                     current.append([lat_f, lon_f])
                     prev_lat, prev_lon = lat_f, lon_f
                 if len(current) >= 2:
-                    segments.append({"day": str(day), "coords": current})
+                    segments.append(
+                        {
+                            "seg_id": f"{day}:{day_segment_idx}",
+                            "day": str(day),
+                            "coords": current,
+                        }
+                    )
 
             self.state._cached_route_key = cache_key
             self.state._cached_route_segments = segments
@@ -1573,79 +1666,128 @@ class Backend(QObject):
     @pyqtSlot(result="QVariant")
     def autoSmoothSelection(self) -> dict[str, Any]:
         active_selection = sorted(self._active_selection())
-        if len(active_selection) < 5:
-            return {"ok": False, "error": "need at least 5 selected points for auto smooth"}
+        if len(active_selection) < 2:
+            return {"ok": False, "error": "need at least 2 selected points for auto repair"}
 
-        coord_df = self.state.df.loc[active_selection, [self.state.lon_col, self.state.lat_col]]
-        if coord_df.isna().any().any():
+        lon_series = self.state.df.loc[active_selection, self.state.lon_col]
+        lat_series = self.state.df.loc[active_selection, self.state.lat_col]
+        if lon_series.isna().any() or lat_series.isna().any():
             return {"ok": False, "error": "selection contains invalid coordinates"}
 
-        pts = coord_df[[self.state.lon_col, self.state.lat_col]].to_numpy(dtype=float)
-        optimized = pts.copy()
-        changed_positions: set[int] = set()
-        idx = 1
-        while idx < len(optimized) - 1:
-            best_single_name = "keep"
-            best_single_candidate = optimized[idx].copy()
-            best_single_sum = self._single_path_sum(optimized, idx, best_single_candidate)
-            for candidate_name, candidate in self._coord_variants(optimized[idx]):
-                candidate_sum = self._single_path_sum(optimized, idx, candidate)
-                if candidate_sum < best_single_sum:
-                    best_single_name = candidate_name
-                    best_single_candidate = candidate
-                    best_single_sum = candidate_sum
-            accept_single = (
-                best_single_name != "keep"
-                and self._should_accept_single(optimized, idx, best_single_candidate)
+        fixed_lons = [float(lon_series.iloc[0])]
+        fixed_lats = [float(lat_series.iloc[0])]
+        prev_valid_lon = None
+        prev_valid_lat = None
+        last_valid_lon = fixed_lons[0]
+        last_valid_lat = fixed_lats[0]
+
+        optimized = np.column_stack([lon_series.to_numpy(dtype=float), lat_series.to_numpy(dtype=float)])
+
+        for pos in range(1, len(active_selection)):
+            curr_raw_lon = float(lon_series.iloc[pos])
+            curr_raw_lat = float(lat_series.iloc[pos])
+            curr_fix_lon, curr_fix_lat = gcj02_to_wgs84(curr_raw_lon, curr_raw_lat)
+
+            dist_if_original = self._geo_distance_m(
+                last_valid_lon, last_valid_lat, curr_raw_lon, curr_raw_lat
             )
+            dist_if_fixed = self._geo_distance_m(
+                last_valid_lon, last_valid_lat, curr_fix_lon, curr_fix_lat
+            )
+            improvement = dist_if_original - dist_if_fixed
 
-            accept_pair = False
-            best_pair_names = ("keep", "keep")
-            best_pair_candidate0 = optimized[idx].copy()
-            best_pair_candidate1 = optimized[idx + 1].copy()
-            if idx < len(optimized) - 2:
-                best_pair_sum = self._pair_path_sum(
-                    optimized, idx, best_pair_candidate0, best_pair_candidate1
+            cond_jump = dist_if_original > AUTO_REPAIR_JUMP_DETECT_THRESHOLD
+            cond_smooth = dist_if_fixed < AUTO_REPAIR_SMOOTH_THRESHOLD
+            sharp_turn = False
+            required_improvement = AUTO_REPAIR_MIN_IMPROVEMENT
+
+            angle_prev_raw = None
+            angle_prev_fix = None
+            angle_next_raw = None
+            angle_next_fix = None
+
+            if prev_valid_lon is not None:
+                angle_prev_raw = self._turning_angle(
+                    (prev_valid_lon, prev_valid_lat),
+                    (last_valid_lon, last_valid_lat),
+                    (curr_raw_lon, curr_raw_lat),
                 )
-                variants0 = self._coord_variants(optimized[idx])
-                variants1 = self._coord_variants(optimized[idx + 1])
-                for name0, cand0 in variants0:
-                    for name1, cand1 in variants1:
-                        pair_sum = self._pair_path_sum(optimized, idx, cand0, cand1)
-                        if pair_sum < best_pair_sum:
-                            best_pair_sum = pair_sum
-                            best_pair_names = (name0, name1)
-                            best_pair_candidate0 = cand0
-                            best_pair_candidate1 = cand1
-                accept_pair = (
-                    best_pair_names != ("keep", "keep")
-                    and self._should_accept_pair(
-                        optimized, idx, best_pair_candidate0, best_pair_candidate1
-                    )
+                angle_prev_fix = self._turning_angle(
+                    (prev_valid_lon, prev_valid_lat),
+                    (last_valid_lon, last_valid_lat),
+                    (curr_fix_lon, curr_fix_lat),
                 )
 
-            if accept_pair and (
-                not accept_single
-                or self._pair_path_sum(optimized, idx, best_pair_candidate0, best_pair_candidate1)
-                <= best_single_sum
-            ):
-                optimized[idx] = best_pair_candidate0
-                optimized[idx + 1] = best_pair_candidate1
-                changed_positions.add(idx)
-                changed_positions.add(idx + 1)
-                idx += 2
-                continue
+            if pos + 2 < len(active_selection):
+                next_raw_lon = float(lon_series.iloc[pos + 1])
+                next_raw_lat = float(lat_series.iloc[pos + 1])
+                next_next_raw_lon = float(lon_series.iloc[pos + 2])
+                next_next_raw_lat = float(lat_series.iloc[pos + 2])
+                angle_next_raw = self._turning_angle(
+                    (curr_raw_lon, curr_raw_lat),
+                    (next_raw_lon, next_raw_lat),
+                    (next_next_raw_lon, next_next_raw_lat),
+                )
+                angle_next_fix = self._turning_angle(
+                    (curr_fix_lon, curr_fix_lat),
+                    (next_raw_lon, next_raw_lat),
+                    (next_next_raw_lon, next_next_raw_lat),
+                )
 
-            if accept_single:
-                optimized[idx] = best_single_candidate
-                changed_positions.add(idx)
-                idx += 1
-                continue
+            angle_margin = 20.0
+            if angle_prev_fix is not None and angle_prev_fix < AUTO_REPAIR_SHARP_TURN_DEG:
+                sharp_turn = True
+            if angle_next_fix is not None and angle_next_fix < AUTO_REPAIR_SHARP_TURN_DEG:
+                sharp_turn = True
+            if angle_prev_fix is not None and angle_prev_raw is not None:
+                if angle_prev_fix + angle_margin < angle_prev_raw:
+                    sharp_turn = True
+            if angle_next_fix is not None and angle_next_raw is not None:
+                if angle_next_fix + angle_margin < angle_next_raw:
+                    sharp_turn = True
+            if sharp_turn:
+                required_improvement = AUTO_REPAIR_MIN_IMPROVEMENT * AUTO_REPAIR_SHARP_GAIN_MULTIPLIER
 
-            idx += 1
+            final_lon = curr_raw_lon
+            final_lat = curr_raw_lat
 
+            if cond_jump and cond_smooth:
+                if improvement >= required_improvement:
+                    final_lon, final_lat = curr_fix_lon, curr_fix_lat
+            elif abs(improvement) < AUTO_REPAIR_AMBIGUOUS_THRESHOLD and pos + 1 < len(active_selection):
+                next_raw_lon = float(lon_series.iloc[pos + 1])
+                next_raw_lat = float(lat_series.iloc[pos + 1])
+                cost_raw = self._geo_distance_m(
+                    last_valid_lon, last_valid_lat, curr_raw_lon, curr_raw_lat
+                ) + self._geo_distance_m(curr_raw_lon, curr_raw_lat, next_raw_lon, next_raw_lat)
+                cost_fix = self._geo_distance_m(
+                    last_valid_lon, last_valid_lat, curr_fix_lon, curr_fix_lat
+                ) + self._geo_distance_m(curr_fix_lon, curr_fix_lat, next_raw_lon, next_raw_lat)
+                lookahead_threshold = AUTO_REPAIR_LOOKAHEAD_GAIN
+                if sharp_turn:
+                    lookahead_threshold *= AUTO_REPAIR_SHARP_GAIN_MULTIPLIER
+                if cost_fix + lookahead_threshold < cost_raw:
+                    final_lon, final_lat = curr_fix_lon, curr_fix_lat
+
+            optimized[pos, 0] = final_lon
+            optimized[pos, 1] = final_lat
+            fixed_lons.append(final_lon)
+            fixed_lats.append(final_lat)
+            prev_valid_lon = last_valid_lon
+            prev_valid_lat = last_valid_lat
+            last_valid_lon = final_lon
+            last_valid_lat = final_lat
+
+        changed_positions = {
+            pos
+            for pos in range(len(active_selection))
+            if (
+                abs(float(optimized[pos, 0]) - float(lon_series.iloc[pos])) > MODIFIED_EPSILON
+                or abs(float(optimized[pos, 1]) - float(lat_series.iloc[pos])) > MODIFIED_EPSILON
+            )
+        }
         if not changed_positions:
-            return {"ok": False, "error": "auto smooth produced no editable changes"}
+            return {"ok": False, "error": "auto repair produced no editable changes"}
 
         now_tag = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         history_batch: list[dict[str, Any]] = []
@@ -1672,12 +1814,12 @@ class Backend(QObject):
                 }
             )
             prev_note = self.state.df.at[idx, "manual_note"]
-            note = f"manual:AUTOCOORD@{now_tag}"
+            note = f"manual:AUTOCOORD_RUNPY@{now_tag}"
             self.state.df.at[idx, self.state.lon_col] = new_lon
             self.state.df.at[idx, self.state.lat_col] = new_lat
             self.state.df.at[idx, "manual_note"] = f"{prev_note} | {note}" if prev_note else note
             self.state.df.at[idx, "manual_timezone"] = self.state.timezone_name
-            self.state.df.at[idx, "manual_mode"] = f"{self.state.selection_mode}:autocoord"
+            self.state.df.at[idx, "manual_mode"] = f"{self.state.selection_mode}:autocoord_runpy"
             self.state.df.at[idx, "manual_updated_at"] = now_tag
 
         if not history_batch:
