@@ -30,7 +30,41 @@ USE_TIME_SEGMENTS = False
 TIME_COLUMN = 'geoTime'
 TIME_SEGMENT_SECONDS = 300
 TIME_STEP_SECONDS = None
+# 相邻点距离过大时断线（米）。<=0 表示不做断线
+MAX_SEGMENT_DISTANCE_METERS = 1000
 # =======================================
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    # 使用 Haversine 公式计算两点球面距离（米）
+    from math import radians, sin, cos, asin, sqrt
+    r = 6371000.0
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+    return 2 * r * asin(sqrt(a))
+
+
+def _split_route_by_distance(points, max_gap_meters: float):
+    if not points:
+        return []
+    if max_gap_meters is None or max_gap_meters <= 0:
+        return [points]
+
+    segments = []
+    current = [points[0]]
+    for lat, lon in points[1:]:
+        prev_lat, prev_lon = current[-1]
+        if _haversine_m(prev_lat, prev_lon, lat, lon) > max_gap_meters:
+            if len(current) >= 2:
+                segments.append(current)
+            current = [(lat, lon)]
+        else:
+            current.append((lat, lon))
+
+    if len(current) >= 2:
+        segments.append(current)
+    return segments
 
 def _normalize_time_series(series: pd.Series) -> pd.Series:
     series = series.dropna()
@@ -44,7 +78,14 @@ def _normalize_time_series(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, unit='s', errors='coerce')
 
 
-def _build_time_features(df: pd.DataFrame, lat_col: str, lon_col: str, time_col: str, segment_seconds: int) -> dict:
+def _build_time_features(
+    df: pd.DataFrame,
+    lat_col: str,
+    lon_col: str,
+    time_col: str,
+    segment_seconds: int,
+    max_gap_meters: float,
+) -> dict:
     df = df[[time_col, lat_col, lon_col]].dropna()
     df = df.sort_values(by=time_col)
     df['__ts'] = _normalize_time_series(df[time_col])
@@ -57,20 +98,57 @@ def _build_time_features(df: pd.DataFrame, lat_col: str, lon_col: str, time_col:
 
     features = []
     for _, group in df.groupby('__seg'):
-        coords = list(zip(group[lon_col], group[lat_col]))
-        times = group['__ts'].dt.strftime('%Y-%m-%dT%H:%M:%S').tolist()
-        if len(coords) < 2:
+        group = group.reset_index(drop=True)
+        if group.shape[0] < 2:
             continue
-        features.append({
-            "type": "Feature",
-            "geometry": {
-                "type": "LineString",
-                "coordinates": coords
-            },
-            "properties": {
-                "times": times
-            }
-        })
+
+        seg_coords = []
+        seg_times = []
+        for i, row in group.iterrows():
+            lat = row[lat_col]
+            lon = row[lon_col]
+            ts = row['__ts'].strftime('%Y-%m-%dT%H:%M:%S')
+            if not seg_coords:
+                seg_coords.append((lon, lat))
+                seg_times.append(ts)
+                continue
+
+            prev_lat = group.loc[i - 1, lat_col]
+            prev_lon = group.loc[i - 1, lon_col]
+            if max_gap_meters is not None and max_gap_meters > 0:
+                gap = _haversine_m(prev_lat, prev_lon, lat, lon)
+            else:
+                gap = 0
+
+            if gap > max_gap_meters:
+                if len(seg_coords) >= 2:
+                    features.append({
+                        "type": "Feature",
+                        "geometry": {
+                            "type": "LineString",
+                            "coordinates": seg_coords
+                        },
+                        "properties": {
+                            "times": seg_times
+                        }
+                    })
+                seg_coords = [(lon, lat)]
+                seg_times = [ts]
+            else:
+                seg_coords.append((lon, lat))
+                seg_times.append(ts)
+
+        if len(seg_coords) >= 2:
+            features.append({
+                "type": "Feature",
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": seg_coords
+                },
+                "properties": {
+                    "times": seg_times
+                }
+            })
 
     return {"type": "FeatureCollection", "features": features}
 
@@ -106,14 +184,14 @@ def visualize_before_after(file_path):
 
     # ================= 原始轨迹（红色） =================
     raw_route = list(zip(df_raw['latitude'], df_raw['longitude']))
-
-    folium.PolyLine(
-        raw_route,
-        color='red',
-        weight=3,
-        opacity=0.6,
-        tooltip='原始轨迹（混合坐标系）'
-    ).add_to(m)
+    for segment in _split_route_by_distance(raw_route, MAX_SEGMENT_DISTANCE_METERS):
+        folium.PolyLine(
+            segment,
+            color='red',
+            weight=3,
+            opacity=0.6,
+            tooltip='原始轨迹（混合坐标系）'
+        ).add_to(m)
 
     # ================= 修复轨迹（仅当有清洁数据时） =================
     if has_clean:
@@ -125,7 +203,8 @@ def visualize_before_after(file_path):
                 lat_col='clean_latitude',
                 lon_col='clean_longitude',
                 time_col=TIME_COLUMN,
-                segment_seconds=TIME_SEGMENT_SECONDS
+                segment_seconds=TIME_SEGMENT_SECONDS,
+                max_gap_meters=MAX_SEGMENT_DISTANCE_METERS
             )
 
             if TIME_STEP_SECONDS is None:
@@ -145,13 +224,14 @@ def visualize_before_after(file_path):
                 max_speed=1
             ).add_to(m)
         else:
-            folium.PolyLine(
-                clean_route,
-                color='blue',
-                weight=4,
-                opacity=0.9,
-                tooltip='修复后轨迹（WGS-84）'
-            ).add_to(m)
+            for segment in _split_route_by_distance(clean_route, MAX_SEGMENT_DISTANCE_METERS):
+                folium.PolyLine(
+                    segment,
+                    color='blue',
+                    weight=4,
+                    opacity=0.9,
+                    tooltip='修复后轨迹（WGS-84）'
+                ).add_to(m)
 
         # ================= 修复后轨迹点（带 geoTime） =================
         if USE_POINT_MARKERS:

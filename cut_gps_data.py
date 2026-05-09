@@ -7,7 +7,7 @@ from datetime import datetime, timezone, timedelta
 
 # ================= 配置区 =================
 
-input_csv = "./data/灵敢足迹（2025.12.22）.csv"
+input_csv = "./data/灵敢足迹（2026.05.09）.csv"
 output_dir = "./output"
 output_csv = os.path.join(output_dir, "cut.csv")
 
@@ -18,8 +18,8 @@ LINE_START = 2      # 起始行（包含表头算第1行）
 LINE_END = 10       # 结束行
 
 # ---------- 时间模式 ----------
-START_TIME = "2025-03-16 10:00:00"
-END_TIME   = "2025-03-18 23:59:00"
+START_TIME = "2025-03-09 10:00:00"
+END_TIME   = "2025-05-09 23:59:00"
 
 TIMEZONE_OFFSET = 2     # UTC+2
 GEOTIME_COLUMN = "geoTime"

@@ -1,0 +1,999 @@
+"""
+Manual GPS repair GUI with SQLite-backed origin/edited/output stores.
+
+Interaction modes:
+- Line repair: choose a timezone, click a line or point to select all points on that local day,
+  then convert the highlighted day between GCJ-02 and WGS-84.
+- Point repair: box-select points or Cmd/Ctrl-click points for multi-select, then convert only
+  the selected points.
+"""
+from __future__ import annotations
+
+import argparse
+import math
+import sqlite3
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
+
+try:
+    from PyQt6.QtCore import QObject, pyqtSlot
+    from PyQt6.QtWebChannel import QWebChannel
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    from PyQt6.QtWidgets import QApplication, QFileDialog
+except Exception as exc:  # pragma: no cover
+    raise SystemExit(
+        "PyQt6 and PyQt6-WebEngine are required. Install with: pip install PyQt6 PyQt6-WebEngine"
+    ) from exc
+
+
+MAX_RENDER_POINTS = 30000
+MAX_SEGMENT_DISTANCE_METERS = 1000.0
+MODIFIED_EPSILON = 1e-9
+DEFAULT_TIMEZONE = "Asia/Shanghai"
+DEFAULT_OUTPUT_PATH = Path("output/gps_data_manual_export.csv")
+COMMON_TIMEZONES = [
+    "Asia/Shanghai",
+    "Asia/Tokyo",
+    "Asia/Singapore",
+    "UTC",
+    "Europe/London",
+    "Europe/Paris",
+    "America/New_York",
+    "America/Chicago",
+    "America/Denver",
+    "America/Los_Angeles",
+]
+
+
+def _out_of_china(lat: float, lon: float) -> bool:
+    return lon < 72.004 or lon > 137.8347 or lat < 0.8293 or lat > 55.8271
+
+
+def wgs84_to_gcj02(lon: float, lat: float) -> tuple[float, float]:
+    if _out_of_china(lat, lon):
+        return lon, lat
+    a = 6378245.0
+    ee = 0.00669342162296594323
+    pi = math.pi
+
+    def transform_lat(x: float, y: float) -> float:
+        ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * math.sqrt(abs(x))
+        ret += (20.0 * math.sin(6.0 * x * pi) + 20.0 * math.sin(2.0 * x * pi)) * 2.0 / 3.0
+        ret += (20.0 * math.sin(y * pi) + 40.0 * math.sin(y / 3.0 * pi)) * 2.0 / 3.0
+        ret += (160.0 * math.sin(y / 12.0 * pi) + 320.0 * math.sin(y * pi / 30.0)) * 2.0 / 3.0
+        return ret
+
+    def transform_lon(x: float, y: float) -> float:
+        ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * math.sqrt(abs(x))
+        ret += (20.0 * math.sin(6.0 * x * pi) + 20.0 * math.sin(2.0 * x * pi)) * 2.0 / 3.0
+        ret += (20.0 * math.sin(x * pi) + 40.0 * math.sin(x / 3.0 * pi)) * 2.0 / 3.0
+        ret += (150.0 * math.sin(x / 12.0 * pi) + 300.0 * math.sin(x / 30.0 * pi)) * 2.0 / 3.0
+        return ret
+
+    dlat = transform_lat(lon - 105.0, lat - 35.0)
+    dlon = transform_lon(lon - 105.0, lat - 35.0)
+    radlat = lat / 180.0 * pi
+    magic = math.sin(radlat)
+    magic = 1 - ee * magic * magic
+    sqrtmagic = math.sqrt(magic)
+    dlat = (dlat * 180.0) / ((a * (1 - ee)) / (magic * sqrtmagic) * pi)
+    dlon = (dlon * 180.0) / (a / sqrtmagic * math.cos(radlat) * pi)
+    mglat = lat + dlat
+    mglon = lon + dlon
+    return mglon, mglat
+
+
+def gcj02_to_wgs84(lon: float, lat: float) -> tuple[float, float]:
+    pi = math.pi
+    a = 6378245.0
+    ee = 0.00669342162296594323
+
+    def transform_lat(x: float, y: float) -> float:
+        ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * math.sqrt(abs(x))
+        ret += (20.0 * math.sin(6.0 * x * pi) + 20.0 * math.sin(2.0 * x * pi)) * 2.0 / 3.0
+        ret += (20.0 * math.sin(y * pi) + 40.0 * math.sin(y / 3.0 * pi)) * 2.0 / 3.0
+        ret += (160.0 * math.sin(y / 12.0 * pi) + 320.0 * math.sin(y * pi / 30.0)) * 2.0 / 3.0
+        return ret
+
+    def transform_lon(x: float, y: float) -> float:
+        ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * math.sqrt(abs(x))
+        ret += (20.0 * math.sin(6.0 * x * pi) + 20.0 * math.sin(2.0 * x * pi)) * 2.0 / 3.0
+        ret += (20.0 * math.sin(x * pi) + 40.0 * math.sin(x / 3.0 * pi)) * 2.0 / 3.0
+        ret += (150.0 * math.sin(x / 12.0 * pi) + 300.0 * math.sin(x / 30.0 * pi)) * 2.0 / 3.0
+        return ret
+
+    dlat = transform_lat(lon - 105.0, lat - 35.0)
+    dlon = transform_lon(lon - 105.0, lat - 35.0)
+    radlat = lat / 180.0 * pi
+    magic = math.sin(radlat)
+    magic = 1 - ee * magic * magic
+    sqrtmagic = math.sqrt(magic)
+    dlat = (dlat * 180.0) / ((a * (1 - ee)) / (magic * sqrtmagic) * pi)
+    dlon = (dlon * 180.0) / (a / sqrtmagic * math.cos(radlat) * pi)
+    mglat = lat + dlat
+    mglon = lon + dlon
+    return lon * 2 - mglon, lat * 2 - mglat
+
+
+def _normalize_time_series(series: pd.Series) -> pd.Series:
+    numeric = pd.to_numeric(series, errors="coerce")
+    if numeric.notna().any():
+        max_val = numeric.dropna().max()
+        unit = "ms" if max_val > 1e10 else "s"
+        return pd.to_datetime(numeric, unit=unit, errors="coerce", utc=True)
+    dt = pd.to_datetime(series, errors="coerce", utc=True)
+    return dt
+
+
+def _sample_indices(n: int, max_n: int) -> np.ndarray:
+    if max_n <= 0 or n <= max_n:
+        return np.arange(n)
+    return np.linspace(0, n - 1, num=max_n, dtype=int)
+
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371000.0
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+@dataclass
+class AppState:
+    df: pd.DataFrame
+    origin_df: pd.DataFrame
+    lon_col: str
+    lat_col: str
+    time_col: Optional[str]
+    dt_series: Optional[pd.Series]
+    input_path: Path
+    output_path: Optional[Path]
+    db_dir: Path
+    origin_db_path: Path
+    edited_db_path: Path
+    output_db_path: Path
+    selection_mode: str = "line"
+    timezone_name: str = DEFAULT_TIMEZONE
+    selected_idx: set[int] = field(default_factory=set)
+    selected_day: Optional[str] = None
+    view_mask: Optional[pd.Series] = None
+    modified_idx: set[int] = field(default_factory=set)
+    history: list[list[dict[str, Any]]] = field(default_factory=list)
+
+    def get_view_df(self) -> pd.DataFrame:
+        if self.view_mask is None:
+            return self.df
+        return self.df[self.view_mask]
+
+    def update_view_all(self) -> None:
+        self.view_mask = pd.Series([True] * len(self.df), index=self.df.index)
+
+    def tzinfo(self) -> ZoneInfo:
+        return ZoneInfo(self.timezone_name)
+
+    def local_dt_series(self) -> Optional[pd.Series]:
+        if self.dt_series is None:
+            return None
+        return self.dt_series.dt.tz_convert(self.tzinfo())
+
+    def local_day_series(self) -> Optional[pd.Series]:
+        local_dt = self.local_dt_series()
+        if local_dt is None:
+            return None
+        return local_dt.dt.strftime("%Y-%m-%d")
+
+
+HTML = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Manual GPS Repair</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
+  <style>
+    html, body {{ height: 100%; margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    #map {{ height: 100%; width: 100%; }}
+    .panel {{
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 999;
+      width: 360px;
+      background: rgba(255, 255, 255, 0.96);
+      border-radius: 12px;
+      padding: 14px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+    }}
+    .title {{ font-size: 17px; font-weight: 600; margin-bottom: 10px; }}
+    .row {{ margin-bottom: 10px; }}
+    .label {{ font-size: 12px; color: #444; margin-bottom: 4px; display: block; }}
+    .buttons {{ display: flex; flex-wrap: wrap; gap: 6px; }}
+    button {{
+      border: 0;
+      border-radius: 8px;
+      padding: 8px 10px;
+      background: #1f77b4;
+      color: white;
+      cursor: pointer;
+    }}
+    button.secondary {{ background: #4c566a; }}
+    button.warn {{ background: #b45309; }}
+    button:disabled {{ opacity: 0.55; cursor: default; }}
+    select, input {{
+      width: 100%;
+      box-sizing: border-box;
+      padding: 7px 8px;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+    }}
+    .hint {{ font-size: 12px; color: #4b5563; line-height: 1.4; }}
+    .status {{
+      font-size: 12px;
+      line-height: 1.45;
+      color: #111827;
+      background: #f8fafc;
+      border-radius: 8px;
+      padding: 8px;
+      white-space: pre-line;
+    }}
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="panel">
+    <div class="title">Manual GPS Repair</div>
+
+    <div class="row">
+      <span class="label">Mode</span>
+      <div class="buttons">
+        <button id="modeLineBtn" onclick="setMode('line')">Line Repair</button>
+        <button id="modePointBtn" class="secondary" onclick="setMode('point')">Point Repair</button>
+      </div>
+    </div>
+
+    <div class="row">
+      <label class="label" for="timezoneSelect">Timezone</label>
+      <input id="timezoneSelect" list="timezoneList" value="{DEFAULT_TIMEZONE}" />
+      <datalist id="timezoneList">
+        {''.join(f'<option value="{tz}"></option>' for tz in COMMON_TIMEZONES)}
+      </datalist>
+    </div>
+
+    <div class="row">
+      <div class="buttons">
+        <button onclick="applyTimezone()">Apply Timezone</button>
+        <button class="secondary" onclick="refresh()">Refresh</button>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="buttons">
+        <button onclick="convertSelection('gcj2wgs')">GCJ-02 -> WGS-84</button>
+        <button onclick="convertSelection('wgs2gcj')">WGS-84 -> GCJ-02</button>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="buttons">
+        <button class="secondary" onclick="clearSelection()">Clear Selection</button>
+        <button class="secondary" onclick="undo()">Undo</button>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="buttons">
+        <button class="warn" onclick="saveFile()">Export CSV</button>
+        <button class="warn" onclick="saveAs()">Export CSV As</button>
+      </div>
+    </div>
+
+    <div class="row status" id="statusText"></div>
+    <div class="hint">
+      Line repair: click any line or point to select that local day.<br>
+      Point repair: draw a rectangle or use Cmd/Ctrl + click for multi-select.
+    </div>
+  </div>
+
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+  <script>
+    const map = L.map('map', {{ preferCanvas: true }});
+    L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap contributors'
+    }}).addTo(map);
+
+    let backend = null;
+    let pointsLayer = null;
+    let lineLayers = [];
+    let currentPayload = null;
+    let hasFitBounds = false;
+
+    const drawnItems = new L.FeatureGroup();
+    map.addLayer(drawnItems);
+    const drawControl = new L.Control.Draw({{
+      draw: {{
+        polygon: false,
+        polyline: false,
+        circle: false,
+        marker: false,
+        circlemarker: false,
+        rectangle: true
+      }},
+      edit: {{ featureGroup: drawnItems, edit: false, remove: true }}
+    }});
+    map.addControl(drawControl);
+
+    function setStatus(text) {{
+      document.getElementById('statusText').textContent = text || '';
+    }}
+
+    function syncControls(payload) {{
+      currentPayload = payload || null;
+      const tzSelect = document.getElementById('timezoneSelect');
+      if (payload && payload.timezone_name) {{
+        tzSelect.value = payload.timezone_name;
+      }}
+      const isLine = !payload || payload.selection_mode === 'line';
+      document.getElementById('modeLineBtn').className = isLine ? '' : 'secondary';
+      document.getElementById('modePointBtn').className = isLine ? 'secondary' : '';
+    }}
+
+    function pointStyle(feature) {{
+      const props = feature.properties || {{}};
+      let color = '#2ca02c';
+      let radius = 3.5;
+      if (props.modified) {{
+        color = '#7c3aed';
+      }}
+      if (props.selected) {{
+        color = '#f97316';
+        radius = 5.5;
+      }}
+      return {{
+        radius,
+        color,
+        fillColor: color,
+        fillOpacity: 0.85,
+        weight: props.selected ? 2 : 1
+      }};
+    }}
+
+    function renderData(payload) {{
+      syncControls(payload);
+      setStatus(payload.status_text || '');
+
+      if (pointsLayer) {{
+        map.removeLayer(pointsLayer);
+        pointsLayer = null;
+      }}
+      if (lineLayers.length) {{
+        lineLayers.forEach(layer => map.removeLayer(layer));
+        lineLayers = [];
+      }}
+
+      const segments = payload.route_segments || [];
+      const allLatLngs = [];
+      segments.forEach(seg => {{
+        const coords = seg.coords || [];
+        if (coords.length < 2) return;
+        const line = L.polyline(coords, {{
+          color: seg.selected ? '#f97316' : '#2563eb',
+          weight: seg.selected ? 5 : 3,
+          opacity: seg.selected ? 0.95 : 0.72
+        }});
+        line.on('click', function() {{
+          if (!backend) return;
+          backend.selectDay(seg.day, function() {{ refresh(false); }});
+        }});
+        line.addTo(map);
+        lineLayers.push(line);
+        coords.forEach(c => allLatLngs.push(c));
+      }});
+
+      const geojson = payload.point_features || {{ type: 'FeatureCollection', features: [] }};
+      pointsLayer = L.geoJSON(geojson, {{
+        pointToLayer: function(feature, latlng) {{
+          return L.circleMarker(latlng, pointStyle(feature));
+        }},
+        onEachFeature: function(feature, layer) {{
+          layer.on('click', function(event) {{
+            if (!backend) return;
+            const props = feature.properties || {{}};
+            if ((payload.selection_mode || 'line') === 'line') {{
+              backend.selectDay(props.local_day || '', function() {{ refresh(false); }});
+              return;
+            }}
+            const e = event.originalEvent || {{}};
+            const additive = !!(e.metaKey || e.ctrlKey);
+            backend.togglePointSelection(props.idx, additive, function() {{ refresh(false); }});
+          }});
+          const props = feature.properties || {{}};
+          const lines = [
+            `idx: ${{props.idx}}`,
+            props.local_time ? `time: ${{props.local_time}}` : null,
+            props.local_day ? `day: ${{props.local_day}}` : null,
+            props.modified ? 'modified' : null,
+          ].filter(Boolean);
+          if (lines.length) {{
+            layer.bindTooltip(lines.join('\\n'));
+          }}
+        }}
+      }}).addTo(map);
+
+      geojson.features.forEach(feature => {{
+        if (feature.geometry && feature.geometry.coordinates) {{
+          const c = feature.geometry.coordinates;
+          allLatLngs.push([c[1], c[0]]);
+        }}
+      }});
+
+      if (!hasFitBounds && allLatLngs.length) {{
+        map.fitBounds(L.latLngBounds(allLatLngs), {{ padding: [30, 30] }});
+        hasFitBounds = true;
+      }} else if (!hasFitBounds && payload.center_lat !== null && payload.center_lon !== null) {{
+        map.setView([payload.center_lat, payload.center_lon], 12);
+      }}
+    }}
+
+    function refresh(resetBounds = false) {{
+      if (resetBounds) {{
+        hasFitBounds = false;
+      }}
+      if (!backend) return;
+      backend.requestData(function(payload) {{
+        renderData(payload);
+      }});
+    }}
+
+    function setMode(mode) {{
+      if (!backend) return;
+      backend.setMode(mode, function(result) {{
+        if (result && result.error) alert(result.error);
+        refresh(false);
+      }});
+    }}
+
+    function applyTimezone() {{
+      if (!backend) return;
+      const tz = document.getElementById('timezoneSelect').value;
+      backend.setTimezone(tz, function(result) {{
+        if (result && result.error) {{
+          alert(result.error);
+        }}
+        refresh(true);
+      }});
+    }}
+
+    function clearSelection() {{
+      if (!backend) return;
+      backend.clearSelection(function() {{ refresh(false); }});
+    }}
+
+    function convertSelection(direction) {{
+      if (!backend) return;
+      backend.convert(direction, function(result) {{
+        if (result && result.error) {{
+          alert(result.error);
+        }}
+        refresh(false);
+      }});
+    }}
+
+    function undo() {{
+      if (!backend) return;
+      backend.undo(function(result) {{
+        if (result && result.error) {{
+          alert(result.error);
+        }}
+        refresh(false);
+      }});
+    }}
+
+    function saveFile() {{
+      if (!backend) return;
+      backend.save(function(result) {{
+        if (result && result.error) {{
+          alert(result.error);
+          return;
+        }}
+        if (result && result.path) {{
+          alert('Exported: ' + result.path);
+        }}
+      }});
+    }}
+
+    function saveAs() {{
+      if (!backend) return;
+      backend.saveAs(function(result) {{
+        if (result && result.error) {{
+          alert(result.error);
+          return;
+        }}
+        if (result && result.path) {{
+          alert('Exported: ' + result.path);
+        }}
+      }});
+    }}
+
+    map.on(L.Draw.Event.CREATED, function(e) {{
+      drawnItems.clearLayers();
+      drawnItems.addLayer(e.layer);
+      if (!backend) return;
+      if (currentPayload && currentPayload.selection_mode !== 'point') {{
+        alert('Rectangle selection is only enabled in point repair mode.');
+        return;
+      }}
+      const bounds = e.layer.getBounds();
+      backend.selectBounds(
+        bounds.getSouth(), bounds.getWest(), bounds.getNorth(), bounds.getEast(),
+        function() {{ refresh(false); }}
+      );
+    }});
+
+    new QWebChannel(qt.webChannelTransport, function(channel) {{
+      backend = channel.objects.backend;
+      refresh(true);
+    }});
+  </script>
+</body>
+</html>
+"""
+
+
+class Backend(QObject):
+    def __init__(self, state: AppState) -> None:
+        super().__init__()
+        self.state = state
+
+    def _status_text(self) -> str:
+        total = len(self.state.df)
+        modified = len(self.state.modified_idx)
+        selected = len(self._active_selection())
+        day_text = self.state.selected_day or "-"
+        return (
+            f"mode: {self.state.selection_mode} | timezone: {self.state.timezone_name}\n"
+            f"total: {total} | modified: {modified} | selected: {selected}\n"
+            f"selected day: {day_text}\n"
+            f"origin db: {self.state.origin_db_path.name} | edited db: {self.state.edited_db_path.name}"
+        )
+
+    def _active_selection(self) -> set[int]:
+        if self.state.selection_mode == "line" and self.state.selected_day:
+            return self._indices_for_day(self.state.selected_day)
+        return set(self.state.selected_idx)
+
+    def _indices_for_day(self, day: str) -> set[int]:
+        day_series = self.state.local_day_series()
+        if day_series is None:
+            return set(self.state.df.index) if day else set()
+        return set(day_series[day_series == day].index.tolist())
+
+    def _is_modified(self, idx: int) -> bool:
+        row = self.state.df.loc[idx]
+        return (
+            abs(float(row[self.state.lon_col]) - float(row["_orig_lon"])) > MODIFIED_EPSILON
+            or abs(float(row[self.state.lat_col]) - float(row["_orig_lat"])) > MODIFIED_EPSILON
+        )
+
+    def _serialize_points(self, df_view: pd.DataFrame) -> dict[str, Any]:
+        features: list[dict[str, Any]] = []
+        idx_list = df_view.index.to_numpy()
+        sample_idx = _sample_indices(len(idx_list), MAX_RENDER_POINTS)
+        local_day_series = self.state.local_day_series()
+        local_dt_series = self.state.local_dt_series()
+        active_selection = self._active_selection()
+        for i in sample_idx:
+            idx = int(idx_list[i])
+            row = df_view.loc[idx]
+            lon = row[self.state.lon_col]
+            lat = row[self.state.lat_col]
+            if pd.isna(lon) or pd.isna(lat):
+                continue
+            local_day = ""
+            local_time = ""
+            if local_day_series is not None:
+                val = local_day_series.at[idx]
+                local_day = "" if pd.isna(val) else str(val)
+            if local_dt_series is not None:
+                val = local_dt_series.at[idx]
+                if pd.notna(val):
+                    local_time = val.strftime("%Y-%m-%d %H:%M:%S")
+            features.append(
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "idx": idx,
+                        "selected": idx in active_selection,
+                        "modified": idx in self.state.modified_idx,
+                        "local_day": local_day,
+                        "local_time": local_time,
+                    },
+                    "geometry": {"type": "Point", "coordinates": [float(lon), float(lat)]},
+                }
+            )
+        return {"type": "FeatureCollection", "features": features}
+
+    def _route_segments(self, df_view: pd.DataFrame) -> list[dict[str, Any]]:
+        if df_view.empty:
+            return []
+
+        segments: list[dict[str, Any]] = []
+        local_day_series = self.state.local_day_series()
+        if local_day_series is None:
+            day_groups = [("all", df_view.index.tolist())]
+        else:
+            day_frame = pd.DataFrame({"day": local_day_series.loc[df_view.index]}, index=df_view.index)
+            day_frame = day_frame.dropna(subset=["day"])
+            day_groups = list(day_frame.groupby("day", sort=False).groups.items())
+
+        for day, idxs in day_groups:
+            selected = self.state.selected_day == day
+            current: list[list[float]] = []
+            prev_lat = prev_lon = None
+            sampled = _sample_indices(len(idxs), MAX_RENDER_POINTS)
+            ordered_idxs = [idxs[i] for i in sampled]
+            for idx in ordered_idxs:
+                row = self.state.df.loc[idx]
+                lon = row[self.state.lon_col]
+                lat = row[self.state.lat_col]
+                if pd.isna(lon) or pd.isna(lat):
+                    continue
+                lat_f = float(lat)
+                lon_f = float(lon)
+                if prev_lat is not None:
+                    gap = _haversine_m(prev_lat, prev_lon, lat_f, lon_f)
+                    if gap > MAX_SEGMENT_DISTANCE_METERS:
+                        if len(current) >= 2:
+                            segments.append({"day": str(day), "selected": selected, "coords": current})
+                        current = []
+                current.append([lat_f, lon_f])
+                prev_lat, prev_lon = lat_f, lon_f
+            if len(current) >= 2:
+                segments.append({"day": str(day), "selected": selected, "coords": current})
+        return segments
+
+    def _update_modified_flags(self, indices: set[int]) -> None:
+        for idx in indices:
+            if self._is_modified(idx):
+                self.state.modified_idx.add(idx)
+            else:
+                self.state.modified_idx.discard(idx)
+
+    def _persist_origin_db(self) -> None:
+        self.state.db_dir.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.state.origin_db_path) as conn:
+            self.state.origin_df.to_sql("origin_records", conn, if_exists="replace", index_label="row_idx")
+
+    def _persist_edited_db(self) -> None:
+        self.state.db_dir.mkdir(parents=True, exist_ok=True)
+        if not self.state.modified_idx:
+            with sqlite3.connect(self.state.edited_db_path) as conn:
+                conn.execute("DROP TABLE IF EXISTS edited_records")
+            return
+
+        idxs = sorted(self.state.modified_idx)
+        edited_df = self.state.origin_df.loc[idxs].copy()
+        edited_df.insert(0, "source_row_idx", idxs)
+        edited_df["original_lon"] = self.state.origin_df.loc[idxs, self.state.lon_col].to_numpy()
+        edited_df["original_lat"] = self.state.origin_df.loc[idxs, self.state.lat_col].to_numpy()
+        edited_df["edited_lon"] = self.state.df.loc[idxs, self.state.lon_col].to_numpy()
+        edited_df["edited_lat"] = self.state.df.loc[idxs, self.state.lat_col].to_numpy()
+        edited_df["manual_note"] = self.state.df.loc[idxs, "manual_note"].to_numpy()
+        edited_df["manual_timezone"] = self.state.df.loc[idxs, "manual_timezone"].to_numpy()
+        edited_df["manual_mode"] = self.state.df.loc[idxs, "manual_mode"].to_numpy()
+        edited_df["manual_updated_at"] = self.state.df.loc[idxs, "manual_updated_at"].to_numpy()
+        with sqlite3.connect(self.state.edited_db_path) as conn:
+            edited_df.to_sql("edited_records", conn, if_exists="replace", index=False)
+
+    def _build_output_df(self) -> pd.DataFrame:
+        output_df = self.state.origin_df.copy()
+        for col in ["manual_note", "manual_timezone", "manual_mode", "manual_updated_at"]:
+            if col not in output_df.columns:
+                output_df[col] = self.state.df[col]
+            else:
+                output_df[col] = self.state.df[col].to_numpy()
+        if self.state.modified_idx:
+            idxs = sorted(self.state.modified_idx)
+            output_df.loc[idxs, self.state.lon_col] = self.state.df.loc[idxs, self.state.lon_col].to_numpy()
+            output_df.loc[idxs, self.state.lat_col] = self.state.df.loc[idxs, self.state.lat_col].to_numpy()
+        return output_df
+
+    def _persist_output_db(self, output_df: pd.DataFrame) -> None:
+        self.state.db_dir.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.state.output_db_path) as conn:
+            output_df.to_sql("output_records", conn, if_exists="replace", index_label="row_idx")
+
+    def _export_csv(self, path: Path) -> dict[str, Any]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        output_df = self._build_output_df()
+        output_df.to_csv(path, index=False)
+        self._persist_output_db(output_df)
+        return {"ok": True, "path": str(path), "output_db": str(self.state.output_db_path)}
+
+    @pyqtSlot(result="QVariant")
+    def requestData(self) -> dict[str, Any]:
+        df_view = self.state.get_view_df()
+        center_lat = center_lon = None
+        if not df_view.empty:
+            valid = df_view[[self.state.lat_col, self.state.lon_col]].dropna()
+            if not valid.empty:
+                center_lat = float(valid[self.state.lat_col].mean())
+                center_lon = float(valid[self.state.lon_col].mean())
+        return {
+            "route_segments": self._route_segments(df_view),
+            "point_features": self._serialize_points(df_view),
+            "center_lat": center_lat,
+            "center_lon": center_lon,
+            "status_text": self._status_text(),
+            "selection_mode": self.state.selection_mode,
+            "timezone_name": self.state.timezone_name,
+        }
+
+    @pyqtSlot(str, result="QVariant")
+    def setMode(self, mode: str) -> dict[str, Any]:
+        if mode not in {"line", "point"}:
+            return {"ok": False, "error": f"invalid mode: {mode}"}
+        self.state.selection_mode = mode
+        self.state.selected_idx.clear()
+        self.state.selected_day = None
+        return {"ok": True}
+
+    @pyqtSlot(str, result="QVariant")
+    def setTimezone(self, timezone_name: str) -> dict[str, Any]:
+        try:
+            ZoneInfo(timezone_name)
+        except Exception:
+            return {"ok": False, "error": f"invalid timezone: {timezone_name}"}
+        self.state.timezone_name = timezone_name
+        if self.state.selected_day is not None and self.state.dt_series is not None:
+            if not self._indices_for_day(self.state.selected_day):
+                self.state.selected_day = None
+        return {"ok": True}
+
+    @pyqtSlot(str, result="QVariant")
+    def selectDay(self, day: str) -> dict[str, Any]:
+        if self.state.selection_mode != "line":
+            return {"ok": False, "error": "day selection is only available in line mode"}
+        if not day:
+            return {"ok": False, "error": "empty day selection"}
+        idxs = self._indices_for_day(day)
+        if not idxs:
+            return {"ok": False, "error": f"no points found for day {day}"}
+        self.state.selected_day = day
+        self.state.selected_idx = idxs
+        return {"ok": True, "selected": len(idxs)}
+
+    @pyqtSlot(float, float, float, float, result="QVariant")
+    def selectBounds(self, south: float, west: float, north: float, east: float) -> dict[str, Any]:
+        if self.state.selection_mode != "point":
+            return {"ok": False, "error": "rectangle selection is only available in point mode"}
+        df_view = self.state.get_view_df()
+        mask = (
+            (df_view[self.state.lon_col] >= west)
+            & (df_view[self.state.lon_col] <= east)
+            & (df_view[self.state.lat_col] >= south)
+            & (df_view[self.state.lat_col] <= north)
+        )
+        self.state.selected_idx = set(df_view[mask].index.tolist())
+        self.state.selected_day = None
+        return {"ok": True, "selected": len(self.state.selected_idx)}
+
+    @pyqtSlot(int, bool, result="QVariant")
+    def togglePointSelection(self, idx: int, additive: bool) -> dict[str, Any]:
+        if self.state.selection_mode != "point":
+            return {"ok": False, "error": "point selection is only available in point mode"}
+        if idx not in self.state.df.index:
+            return {"ok": False, "error": f"invalid index: {idx}"}
+        if not additive:
+            self.state.selected_idx = {idx}
+        elif idx in self.state.selected_idx:
+            self.state.selected_idx.discard(idx)
+        else:
+            self.state.selected_idx.add(idx)
+        self.state.selected_day = None
+        return {"ok": True, "selected": len(self.state.selected_idx)}
+
+    @pyqtSlot(result="QVariant")
+    def clearSelection(self) -> dict[str, Any]:
+        self.state.selected_idx.clear()
+        self.state.selected_day = None
+        return {"ok": True}
+
+    @pyqtSlot(float, float, result="QVariant")
+    def applyWindow(self, before_hours: float, after_hours: float) -> dict[str, Any]:
+        # Compatibility slot kept intentionally. New workflow always renders the full dataset.
+        _ = before_hours
+        _ = after_hours
+        self.state.update_view_all()
+        return {"ok": True}
+
+    @pyqtSlot(result="QVariant")
+    def showAll(self) -> dict[str, Any]:
+        self.state.update_view_all()
+        return {"ok": True}
+
+    @pyqtSlot(str, result="QVariant")
+    def convert(self, direction: str) -> dict[str, Any]:
+        if direction not in {"gcj2wgs", "wgs2gcj"}:
+            return {"ok": False, "error": f"invalid direction: {direction}"}
+        active_selection = self._active_selection()
+        if not active_selection:
+            return {"ok": False, "error": "no active selection"}
+
+        history_batch: list[dict[str, Any]] = []
+        now_tag = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for idx in sorted(active_selection):
+            lon = self.state.df.at[idx, self.state.lon_col]
+            lat = self.state.df.at[idx, self.state.lat_col]
+            if pd.isna(lon) or pd.isna(lat):
+                continue
+            history_batch.append(
+                {
+                    "idx": idx,
+                    "lon": lon,
+                    "lat": lat,
+                    "note": self.state.df.at[idx, "manual_note"],
+                    "timezone": self.state.df.at[idx, "manual_timezone"],
+                    "mode": self.state.df.at[idx, "manual_mode"],
+                    "updated_at": self.state.df.at[idx, "manual_updated_at"],
+                }
+            )
+            if direction == "gcj2wgs":
+                new_lon, new_lat = gcj02_to_wgs84(float(lon), float(lat))
+                note = f"manual:GCJ->WGS@{now_tag}"
+            else:
+                new_lon, new_lat = wgs84_to_gcj02(float(lon), float(lat))
+                note = f"manual:WGS->GCJ@{now_tag}"
+            prev_note = self.state.df.at[idx, "manual_note"]
+            self.state.df.at[idx, self.state.lon_col] = new_lon
+            self.state.df.at[idx, self.state.lat_col] = new_lat
+            self.state.df.at[idx, "manual_note"] = f"{prev_note} | {note}" if prev_note else note
+            self.state.df.at[idx, "manual_timezone"] = self.state.timezone_name
+            self.state.df.at[idx, "manual_mode"] = self.state.selection_mode
+            self.state.df.at[idx, "manual_updated_at"] = now_tag
+
+        if not history_batch:
+            return {"ok": False, "error": "no valid coordinates in selection"}
+        self.state.history.append(history_batch)
+        self._update_modified_flags(active_selection)
+        self._persist_edited_db()
+        return {"ok": True, "converted": len(history_batch)}
+
+    @pyqtSlot(result="QVariant")
+    def undo(self) -> dict[str, Any]:
+        if not self.state.history:
+            return {"ok": False, "error": "no history"}
+        batch = self.state.history.pop()
+        touched: set[int] = set()
+        for item in batch:
+            idx = item["idx"]
+            self.state.df.at[idx, self.state.lon_col] = item["lon"]
+            self.state.df.at[idx, self.state.lat_col] = item["lat"]
+            self.state.df.at[idx, "manual_note"] = item["note"]
+            self.state.df.at[idx, "manual_timezone"] = item["timezone"]
+            self.state.df.at[idx, "manual_mode"] = item["mode"]
+            self.state.df.at[idx, "manual_updated_at"] = item["updated_at"]
+            touched.add(idx)
+        self._update_modified_flags(touched)
+        self._persist_edited_db()
+        return {"ok": True, "undone": len(batch)}
+
+    @pyqtSlot(result="QVariant")
+    def save(self) -> dict[str, Any]:
+        path = self.state.output_path or DEFAULT_OUTPUT_PATH
+        return self._export_csv(path)
+
+    @pyqtSlot(result="QVariant")
+    def saveAs(self) -> dict[str, Any]:
+        file_path, _ = QFileDialog.getSaveFileName(
+            None,
+            "Export CSV",
+            str((self.state.output_path or DEFAULT_OUTPUT_PATH).resolve()),
+            "CSV Files (*.csv)",
+        )
+        if not file_path:
+            return {"ok": False}
+        export_path = Path(file_path)
+        self.state.output_path = export_path
+        return self._export_csv(export_path)
+
+
+def load_state(input_path: Path, output_path: Optional[Path], db_dir: Optional[Path]) -> AppState:
+    df = pd.read_csv(input_path, low_memory=False).reset_index(drop=True)
+    origin_df = df.copy()
+
+    if "clean_longitude" in df.columns and "clean_latitude" in df.columns:
+        lon_col, lat_col = "clean_longitude", "clean_latitude"
+    elif "longitude" in df.columns and "latitude" in df.columns:
+        lon_col, lat_col = "longitude", "latitude"
+    else:
+        raise SystemExit("Missing longitude/latitude columns.")
+
+    time_col = "geoTime" if "geoTime" in df.columns else None
+    dt_series = _normalize_time_series(df[time_col]) if time_col else None
+
+    df["_orig_lon"] = origin_df[lon_col]
+    df["_orig_lat"] = origin_df[lat_col]
+    if "manual_note" not in df.columns:
+        df["manual_note"] = ""
+    if "manual_timezone" not in df.columns:
+        df["manual_timezone"] = ""
+    if "manual_mode" not in df.columns:
+        df["manual_mode"] = ""
+    if "manual_updated_at" not in df.columns:
+        df["manual_updated_at"] = ""
+
+    stem = input_path.stem
+    store_dir = db_dir or Path("data/manual_store") / stem
+    state = AppState(
+        df=df,
+        origin_df=origin_df,
+        lon_col=lon_col,
+        lat_col=lat_col,
+        time_col=time_col,
+        dt_series=dt_series,
+        input_path=input_path,
+        output_path=output_path,
+        db_dir=store_dir,
+        origin_db_path=store_dir / "origin.db",
+        edited_db_path=store_dir / "edited.db",
+        output_db_path=store_dir / "output.db",
+    )
+    state.update_view_all()
+
+    backend_seed = Backend(state)
+    backend_seed._persist_origin_db()
+    backend_seed._persist_edited_db()
+    return state
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Manual GPS repair GUI")
+    parser.add_argument("--input", "-i", type=str, help="input CSV")
+    parser.add_argument("--output", "-o", type=str, help="exported CSV path")
+    parser.add_argument("--db-dir", type=str, help="directory for origin/edited/output SQLite files")
+    args = parser.parse_args()
+
+    app = QApplication(sys.argv)
+    if args.input:
+        input_path = Path(args.input)
+    else:
+        file_path, _ = QFileDialog.getOpenFileName(
+            None, "Open CSV", str(Path.cwd()), "CSV Files (*.csv)"
+        )
+        if not file_path:
+            raise SystemExit("No input file selected.")
+        input_path = Path(file_path)
+
+    output_path = Path(args.output) if args.output else None
+    db_dir = Path(args.db_dir) if args.db_dir else None
+
+    state = load_state(input_path, output_path, db_dir)
+    backend = Backend(state)
+
+    view = QWebEngineView()
+    channel = QWebChannel()
+    channel.registerObject("backend", backend)
+    view.page().setWebChannel(channel)
+    view.setHtml(HTML)
+    view.setWindowTitle("Manual GPS Repair")
+    view.resize(1360, 860)
+    view.show()
+    app.exec()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,7 +1,19 @@
-"""
-Render GPS trajectories with pydeck (WebGL) for large datasets.
-Output: interactive HTML file.
-"""
+'''
+GPS 轨迹数据可视化脚本
+
+功能说明:
+  - 读取包含 GPS 坐标的 CSV 文件
+  - 在交互式地图上绘制轨迹路线
+  - 支持对比原始轨迹与清理后轨迹
+  - 适用于大规模数据的 WebGL 渲染
+  - 输出交互式 HTML 网页
+  
+技术栈:
+  - 地图库: pydeck (基于 deck.gl / WebGL)
+  - 地图数据源: 外部 Carto basemap (无 token)
+  - 坐标系: WGS-84 (GPS 标准坐标系)
+  - 输出格式: 交互式 HTML 网页
+'''
 
 from pathlib import Path
 
@@ -98,11 +110,9 @@ def visualize_pydeck(file_path: str, output_html: str) -> None:
         layers=layers,
         initial_view_state=view_state,
         map_style=MAP_STYLE,
-        tooltip=None,
-        controller={"doubleClickZoom": False},
     )
 
-    deck.to_html(output_html, title="GPS Trajectory (pydeck)")
+    deck.to_html(output_html)
     print(f"Wrote {output_html}")
 
 
